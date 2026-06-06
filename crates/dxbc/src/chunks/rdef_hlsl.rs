@@ -16,6 +16,7 @@ use alloc::string::String;
 use alloc::vec::Vec;
 use core::fmt::Write as _;
 
+use super::ChunkWriter;
 use super::rdef::{
     BIND_FLAG_COMPARISON_SAMPLER, BIND_FLAG_TEX_COMP_0, BIND_FLAG_TEX_COMP_1, BIND_FLAG_USED,
     BIND_FLAG_USER_PACKED, CBufferDef, CBufferVariable, MemberDesc, ResourceBinding, ResourceDef,
@@ -231,27 +232,21 @@ fn split_name(tok: &str) -> Option<(&str, u16)> {
 // Emit
 // ---------------------------------------------------------------------------
 
-/// Look up the element struct name for a structured-buffer binding (cosmetic).
-fn struct_elem_name<'a>(b: &ResourceBinding<'_>, rd: &'a ResourceDef<'_>) -> Option<&'a str> {
+/// HLSL element-type spelling for a structured-buffer binding (its `$Element`
+/// variable's type), used as the `<T>` in `StructuredBuffer<T>`. This lets the
+/// merged form reconstruct the resource's constant-buffer def from the binding.
+fn elem_type_ref(b: &ResourceBinding<'_>, rd: &ResourceDef<'_>) -> Option<String> {
     let cb = rd.constant_buffers.iter().find(|c| c.name == b.name)?;
     let v = cb.variables.first()?;
-    if v.var_type.members.is_empty() {
-        None
-    } else {
-        Some(v.var_type.name.as_ref())
-    }
+    type_ref(&v.var_type)
 }
 
 /// `(typespec, register-class char)` for a binding; None if unmodelled.
 fn binding_typespec(b: &ResourceBinding<'_>, rd: &ResourceDef<'_>) -> Option<(String, char)> {
-    let elem = || struct_elem_name(b, rd).unwrap_or("");
-    let wrap = |kw: &str| {
-        let e = elem();
-        if e.is_empty() {
-            String::from(kw)
-        } else {
-            alloc::format!("{kw}<{e}>")
-        }
+    let elem = elem_type_ref(b, rd);
+    let wrap = |kw: &str| match &elem {
+        Some(e) => alloc::format!("{kw}<{e}>"),
+        None => String::from(kw),
     };
     let texture = |prefix: &str| -> Option<String> {
         let dim = dim_to_hlsl(b.dimension)?;
@@ -456,28 +451,92 @@ pub fn rdef_to_hlsl(rd: &ResourceDef<'_>) -> Option<String> {
         o.push('\n');
     }
 
-    // Resource bindings, in binding-array order.
+    // Body: prefer merged single-declaration cbuffers; fall back to the
+    // two-section form when the array orderings don't allow a faithful merge.
+    if let Some(body) = emit_merged_body(rd, sm5) {
+        let full = alloc::format!("{o}{body}");
+        if let Some(rd2) = rdef_from_hlsl(&full)
+            && rd2.to_writable().data == rd.to_writable().data
+        {
+            return Some(full);
+        }
+    }
+    let body = emit_twosection_body(rd, sm5)?;
+    Some(alloc::format!("{o}{body}"))
+}
+
+fn emit_cbuffer_block(
+    o: &mut String,
+    cb: &CBufferDef<'_>,
+    sm5: bool,
+    register: Option<u32>,
+    bind_flags: u32,
+) -> Option<()> {
+    let _ = write!(o, "cbuffer {}", cb.name);
+    if let Some(slot) = register {
+        let _ = write!(o, " : register(b{slot})");
+    }
+    if bind_flags != 0 {
+        let _ = write!(o, " flags={}", bind_flags_str(bind_flags));
+    }
+    if cb.cb_type != 0 {
+        let _ = write!(o, " kind={}", cb.cb_type);
+    }
+    if cb.flags != 0 {
+        let _ = write!(o, " cbflags={:x}", cb.flags);
+    }
+    o.push_str(" {\n");
+    for v in &cb.variables {
+        emit_var(o, v, "    ", sm5)?;
+    }
+    o.push_str("};\n");
+    Some(())
+}
+
+/// Two-section body: every binding as a declaration, then every cbuffer layout.
+fn emit_twosection_body(rd: &ResourceDef<'_>, sm5: bool) -> Option<String> {
+    let mut o = String::new();
     for b in &rd.bindings {
         emit_binding(&mut o, b, rd)?;
     }
     if !rd.bindings.is_empty() {
         o.push('\n');
     }
-
-    // Constant-buffer / resource layouts, in cbuffer-array order.
     for cb in &rd.constant_buffers {
-        let _ = write!(o, "cbuffer {}", cb.name);
-        if cb.cb_type != 0 {
-            let _ = write!(o, " kind={}", cb.cb_type);
+        emit_cbuffer_block(&mut o, cb, sm5, None, 0)?;
+    }
+    Some(o)
+}
+
+/// Merged body: cbuffer bindings become single `cbuffer N : register(bN) {..}`
+/// blocks and resource cbuffer defs are reconstructed from their bindings.
+/// Returns None when binding order can't reproduce the cbuffer-def order.
+fn emit_merged_body(rd: &ResourceDef<'_>, sm5: bool) -> Option<String> {
+    // Only merge when every cbuffer def is a plain register cbuffer (kind 0);
+    // resource defs (structured buffers etc.) keep the two-section form so no
+    // def has to be reconstructed from a binding.
+    if rd.constant_buffers.iter().any(|c| c.cb_type != 0) {
+        return None;
+    }
+    // The cbuffer bindings, in binding order, must match the cbuffer-def order.
+    let bnames: Vec<&str> = rd
+        .bindings
+        .iter()
+        .filter(|b| b.input_type == 0)
+        .map(|b| b.name.as_ref())
+        .collect();
+    let dnames: Vec<&str> = rd.constant_buffers.iter().map(|c| c.name.as_ref()).collect();
+    if bnames != dnames || bnames.len() != rd.constant_buffers.len() {
+        return None;
+    }
+    let mut o = String::new();
+    for b in &rd.bindings {
+        if b.input_type == 0 {
+            let cb = rd.constant_buffers.iter().find(|c| c.name == b.name)?;
+            emit_cbuffer_block(&mut o, cb, sm5, Some(b.bind_point), b.flags)?;
+        } else {
+            emit_binding(&mut o, b, rd)?;
         }
-        if cb.flags != 0 {
-            let _ = write!(o, " cbflags={:x}", cb.flags);
-        }
-        o.push_str(" {\n");
-        for v in &cb.variables {
-            emit_var(&mut o, v, "    ", sm5)?;
-        }
-        o.push_str("};\n");
     }
     Some(o)
 }
@@ -917,13 +976,36 @@ pub fn rdef_from_hlsl(text: &str) -> Option<ResourceDef<'static>> {
                 block = Some(Block::Struct(hdr, Vec::new()));
             }
             "cbuffer" => {
-                // Could be a binding line (`cbuffer N : register(b0);`) or a
-                // block opener (`cbuffer N [kind=..] [cbflags=..] {`).
+                // Three shapes: a merged block `cbuffer N : register(bN) {` (a
+                // binding *and* its layout), a two-section layout block
+                // `cbuffer N [kind=..] [cbflags=..] {`, or a two-section binding
+                // line `cbuffer N : register(bN);`.
                 if line.ends_with('{') {
                     let inner = rest.trim_end_matches('{').trim();
                     let mut it = inner.split_whitespace();
                     let name = it.next()?;
-                    let m = kv(it);
+                    let toks: Vec<&str> = it.collect();
+                    let m = kv(toks.iter().copied());
+                    if let Some(reg) = toks
+                        .iter()
+                        .find_map(|t| t.strip_prefix("register(").and_then(|s| s.strip_suffix(')')))
+                    {
+                        // Merged: emit both the binding and the layout def.
+                        let slot: u32 = reg.get(1..)?.parse().ok()?;
+                        rd.bindings.push(ResourceBinding {
+                            name: Cow::Owned(String::from(name)),
+                            input_type: 0,
+                            return_type: 0,
+                            dimension: 0,
+                            num_samples: 0,
+                            bind_point: slot,
+                            bind_count: 1,
+                            flags: match m.get("flags") {
+                                Some(s) => bind_flags_from(s)?,
+                                None => 0,
+                            },
+                        });
+                    }
                     rd.constant_buffers.push(CBufferDef {
                         name: Cow::Owned(String::from(name)),
                         variables: Vec::new(),
