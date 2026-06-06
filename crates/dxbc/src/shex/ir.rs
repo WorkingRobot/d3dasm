@@ -20,7 +20,7 @@ pub type SmallU32Vec = SmallVec<[u32; 8]>;
 pub type FlagNames = SmallVec<[&'static str; 8]>;
 
 /// A decoded SM4/SM5 shader program.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct Program {
     /// Shader stage name (`"vs"`, `"ps"`, `"gs"`, `"hs"`, `"ds"`, or `"cs"`).
     pub shader_type: &'static str,
@@ -282,9 +282,16 @@ pub enum InstructionKind {
     CustomData {
         /// Custom data sub-type (ICB, comment, opaque, etc.).
         subtype: CustomDataType,
-        /// ICB values as four-component float vectors.
+        /// ICB values as four-component float vectors (used for
+        /// [`CustomDataType::ImmediateConstantBuffer`]).
         values: Vec<[f32; 4]>,
-        /// Total dword count of the custom data block (including header).
+        /// Raw payload dwords following the two-dword header, preserved for
+        /// non-ICB subtypes (comment/debuginfo/opaque/other) so the block
+        /// re-encodes byte-identically. Empty for ICB (see `values`).
+        raw: Vec<u32>,
+        /// Total dword count of the custom data block (including the
+        /// two-dword header). Equals `2 + values.len() * 4` for ICB, or
+        /// `2 + raw.len()` otherwise.
         raw_dword_count: usize,
     },
 }

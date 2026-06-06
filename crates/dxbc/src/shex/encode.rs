@@ -45,10 +45,11 @@ fn encode_instruction(instr: &Instruction, out: &mut Vec<u32>) {
     if let InstructionKind::CustomData {
         subtype,
         values,
+        raw,
         raw_dword_count,
     } = &instr.kind
     {
-        encode_custom_data(opcode_val, subtype, values, *raw_dword_count, out);
+        encode_custom_data(opcode_val, subtype, values, raw, *raw_dword_count, out);
         return;
     }
 
@@ -219,7 +220,7 @@ fn build_token0_opdata(instr: &Instruction) -> u32 {
 }
 
 /// Map a resource dimension string back to its token0 integer value.
-fn dimension_to_u32(dim: &str) -> u32 {
+pub(crate) fn dimension_to_u32(dim: &str) -> u32 {
     match dim {
         "buffer" => 1,
         "texture1d" => 2,
@@ -241,6 +242,7 @@ fn encode_custom_data(
     opcode_val: u32,
     subtype: &CustomDataType,
     values: &[[f32; 4]],
+    raw: &[u32],
     raw_dword_count: usize,
     out: &mut Vec<u32>,
 ) {
@@ -253,19 +255,19 @@ fn encode_custom_data(
     };
     // Token0: opcode in bits [0:10], subtype in bits [11:15]
     out.push((opcode_val & 0x7FF) | (subtype_val << 11));
-    // Token1: total dword count (header + data).
-    // For ICB, the total is 2 (header) + values.len() * 4
-    let total = if *subtype == CustomDataType::ImmediateConstantBuffer {
-        2 + values.len() * 4
-    } else {
-        raw_dword_count
-    };
-    out.push(total as u32);
-    // Emit ICB float data.
-    for row in values {
-        for val in row {
-            out.push(val.to_bits());
+    if *subtype == CustomDataType::ImmediateConstantBuffer {
+        // Token1: total = 2 (header) + values.len() * 4, then ICB float rows.
+        out.push((2 + values.len() * 4) as u32);
+        for row in values {
+            for val in row {
+                out.push(val.to_bits());
+            }
         }
+    } else {
+        // Token1: total dword count, then the preserved raw payload.
+        let total = raw_dword_count.max(2 + raw.len());
+        out.push(total as u32);
+        out.extend_from_slice(raw);
     }
 }
 
@@ -503,7 +505,7 @@ fn encode_return_type_token(rt: &[ReturnType; 4]) -> u32 {
 }
 
 /// Convert a system value name string back to its `D3D10_SB_NAME` / `D3D11_SB_NAME` value.
-fn system_value_to_u32(name: &str) -> u32 {
+pub(crate) fn system_value_to_u32(name: &str) -> u32 {
     match name {
         "undefined" => 0,
         "position" => 1,

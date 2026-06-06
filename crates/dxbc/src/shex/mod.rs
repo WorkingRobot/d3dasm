@@ -10,12 +10,14 @@
 
 use alloc::string::String;
 
+pub mod asm;
 mod decode;
 mod encode;
 mod fmt;
 mod ir;
 mod opcodes;
 
+pub use self::asm::{AsmError, parse as assemble, serialize};
 pub use self::decode::*;
 pub use self::encode::*;
 pub use self::fmt::*;

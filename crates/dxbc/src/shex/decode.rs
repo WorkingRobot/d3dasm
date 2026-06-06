@@ -252,13 +252,27 @@ fn decode_instruction(tokens: &[u32], opcode_val: u32) -> Instruction {
         _ => decode_generic(tokens),
     };
 
+    // Token0 bits 13 and 19-22 encode saturate / precise for ALU and phase
+    // instructions, but for declaration opcodes those same bit positions carry
+    // payload (dimension, sample count, etc.). The encoder reconstructs
+    // declaration token0 bits from the typed kind and ignores these modifier
+    // fields, so suppress them here to keep the IR free of payload garbage.
+    let is_modifier_kind = matches!(
+        kind,
+        InstructionKind::Generic { .. } | InstructionKind::HsPhase
+    );
+
     Instruction {
         opcode: op,
-        saturate,
-        test_nonzero,
-        precise_mask,
-        resinfo_return_type,
-        sync_flags,
+        saturate: saturate && is_modifier_kind,
+        test_nonzero: test_nonzero && is_modifier_kind,
+        precise_mask: if is_modifier_kind { precise_mask } else { 0 },
+        resinfo_return_type: if is_modifier_kind {
+            resinfo_return_type
+        } else {
+            None
+        },
+        sync_flags: if is_modifier_kind { sync_flags } else { 0 },
         tex_offsets,
         resource_dim,
         resource_return_type,
@@ -272,24 +286,31 @@ fn decode_custom_data(tokens: &[u32]) -> InstructionKind {
     let subtype_val = (tokens[0] >> 11) & 0x1F;
     let subtype = CustomDataType::from_u32(subtype_val);
     let mut values = Vec::new();
-    if subtype == CustomDataType::ImmediateConstantBuffer && tokens.len() > 2 {
-        let count = (tokens.len() - 2) / 4;
-        for i in 0..count {
-            let base = 2 + i * 4;
-            if base + 4 > tokens.len() {
-                break;
+    let mut raw = Vec::new();
+    if subtype == CustomDataType::ImmediateConstantBuffer {
+        if tokens.len() > 2 {
+            let count = (tokens.len() - 2) / 4;
+            for i in 0..count {
+                let base = 2 + i * 4;
+                if base + 4 > tokens.len() {
+                    break;
+                }
+                values.push([
+                    f32::from_bits(tokens[base]),
+                    f32::from_bits(tokens[base + 1]),
+                    f32::from_bits(tokens[base + 2]),
+                    f32::from_bits(tokens[base + 3]),
+                ]);
             }
-            values.push([
-                f32::from_bits(tokens[base]),
-                f32::from_bits(tokens[base + 1]),
-                f32::from_bits(tokens[base + 2]),
-                f32::from_bits(tokens[base + 3]),
-            ]);
         }
+    } else if tokens.len() > 2 {
+        // Preserve the raw payload of non-ICB blocks so they re-encode exactly.
+        raw.extend_from_slice(&tokens[2..]);
     }
     InstructionKind::CustomData {
         subtype,
         values,
+        raw,
         raw_dword_count: tokens.len(),
     }
 }
@@ -562,13 +583,15 @@ fn decode_extended_tokens(tokens: &[u32]) -> (Option<[i8; 3]>, Option<u32>, Opti
                 let w = sign_extend_4bit((ext >> 17) & 0xF);
                 tex_offsets = Some([u, v, w]);
             }
-            // Type 2 = D3D10_SB_EXTENDED_OPCODE_RESOURCE_DIM
+            // Type 2 = D3D10_SB_EXTENDED_OPCODE_RESOURCE_DIM.
+            // Mask off the continuation bit (31): it is structural (re-derived
+            // by the encoder), not part of the semantic dimension/stride value.
             2 => {
-                resource_dim = Some(ext);
+                resource_dim = Some(ext & 0x7FFF_FFFF);
             }
             // Type 3 = D3D10_SB_EXTENDED_OPCODE_RESOURCE_RETURN_TYPE
             3 => {
-                resource_return_type = Some(ext);
+                resource_return_type = Some(ext & 0x7FFF_FFFF);
             }
             _ => {}
         }

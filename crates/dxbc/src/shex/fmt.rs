@@ -61,6 +61,7 @@ pub fn write_instruction(w: &mut dyn Write, instr: &Instruction) -> core::fmt::R
             subtype,
             values,
             raw_dword_count,
+            ..
         } => write_custom_data(w, subtype, values, *raw_dword_count),
         _ => write_declaration(w, instr),
     }
@@ -127,7 +128,7 @@ pub fn format_operand(op: &Operand) -> String {
 
 /// Operand value type, used to select the correct immediate formatting.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum ImmediateType {
+pub(crate) enum ImmediateType {
     /// Display immediates as floating-point (e.g. `1.000000`).
     Float,
     /// Display immediates as signed decimal integers (e.g. `-3`).
@@ -137,7 +138,7 @@ enum ImmediateType {
 }
 
 /// Classify an opcode's source operand type for immediate formatting.
-fn opcode_imm_type(op: Opcode) -> ImmediateType {
+pub(crate) fn opcode_imm_type(op: Opcode) -> ImmediateType {
     match op {
         // Float ALU
         Opcode::Add | Opcode::Div | Opcode::Dp2 | Opcode::Dp3 | Opcode::Dp4
