@@ -277,7 +277,9 @@ fn emit_binding(o: &mut String, b: &ResourceBinding<'_>, rd: &ResourceDef<'_>) -
     if !is_texture(b.input_type) && b.return_type != 0 {
         let _ = write!(o, " ret={}", b.return_type);
     }
-    if b.num_samples != 0 {
+    if b.num_samples == 0xFFFF_FFFF {
+        o.push_str(" samples=-1");
+    } else if b.num_samples != 0 {
         let _ = write!(o, " samples={}", b.num_samples);
     }
     if b.flags != 0 {
@@ -548,7 +550,7 @@ fn parse_binding(line: &str) -> Option<ResourceBinding<'static>> {
         return_type = r.parse().ok()?;
     }
     let num_samples = match m.get("samples") {
-        Some(s) => s.parse().ok()?,
+        Some(s) => s.parse::<i64>().ok()? as u32, // accepts -1 sentinel
         None => 0,
     };
     let flags = match m.get("flags") {
