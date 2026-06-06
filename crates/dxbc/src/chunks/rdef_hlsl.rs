@@ -38,6 +38,20 @@ fn base_size(var_type: u16) -> u32 {
     }
 }
 
+/// Byte size of a type: the struct span for struct types, else the natural
+/// scalar/vector/matrix size. Used to derive structured-buffer strides.
+fn type_size(td: &TypeDesc<'_>) -> u32 {
+    if td.members.is_empty() {
+        natural_size(td).unwrap_or(0)
+    } else {
+        td.members
+            .iter()
+            .filter_map(|m| natural_size(&m.member_type).map(|s| m.offset + s))
+            .max()
+            .unwrap_or(0)
+    }
+}
+
 /// Natural byte size of a non-array scalar/vector/matrix type.
 fn natural_size(td: &TypeDesc<'_>) -> Option<u32> {
     if td.elements != 0 || !td.members.is_empty() {
@@ -295,9 +309,7 @@ fn emit_binding(o: &mut String, b: &ResourceBinding<'_>, rd: &ResourceDef<'_>) -
         let _ = write!(o, " ret={}", b.return_type);
     }
     if structured {
-        if b.num_samples != 0 {
-            let _ = write!(o, " stride={}", b.num_samples);
-        }
+        // stride == sizeof(element); derived from the def on parse.
     } else if is_texture(b.input_type) {
         if b.num_samples != 0xFFFF_FFFF {
             let _ = write!(o, " samples={}", b.num_samples);
@@ -1042,6 +1054,23 @@ pub fn rdef_from_hlsl(text: &str) -> Option<ResourceDef<'static>> {
         } else {
             end
         };
+    }
+
+    // A structured-buffer binding's stride (num_samples) is sizeof(element),
+    // derived from its matching resource def's `$Element` type.
+    let strides: Vec<(usize, u32)> = rd
+        .bindings
+        .iter()
+        .enumerate()
+        .filter(|(_, b)| matches!(b.input_type, 5 | 6 | 9 | 10 | 11) && b.num_samples == 0)
+        .filter_map(|(i, b)| {
+            let cb = rd.constant_buffers.iter().find(|c| c.name == b.name)?;
+            let v = cb.variables.first()?;
+            Some((i, type_size(&v.var_type)))
+        })
+        .collect();
+    for (i, s) in strides {
+        rd.bindings[i].num_samples = s;
     }
     Some(rd)
 }
