@@ -18,8 +18,7 @@ use core::fmt::Write as _;
 
 use super::ChunkWriter;
 use super::rdef::{
-    BIND_FLAG_COMPARISON_SAMPLER, BIND_FLAG_TEX_COMP_0, BIND_FLAG_TEX_COMP_1, BIND_FLAG_USED,
-    BIND_FLAG_USER_PACKED, CBufferDef, CBufferVariable, MemberDesc, ResourceBinding, ResourceDef,
+    BIND_FLAG_USED, CBufferDef, CBufferVariable, MemberDesc, ResourceBinding, ResourceDef,
     SLOT_UNUSED, TypeDesc, hlsl_type_name, parse_hlsl_type,
 };
 use crate::shex::{ComponentSelect, Operand, OperandIndex, Program, RegisterType};
@@ -210,16 +209,30 @@ fn packoffset_parse(s: &str) -> Option<u32> {
     Some(reg * 16 + comp * 4)
 }
 
+/// `D3D_SHADER_INPUT_FLAGS` bits (the binding-flags field uses different bit
+/// meanings than the variable-flags field).
+const SIF_USER_PACKED: u32 = 0x1;
+const SIF_COMPARISON_SAMPLER: u32 = 0x2;
+const SIF_TEXTURE_COMPONENT_0: u32 = 0x4;
+const SIF_TEXTURE_COMPONENT_1: u32 = 0x8;
+const SIF_UNUSED: u32 = 0x10;
+/// The two texture-component bits encode (component count − 1).
+const SIF_TEX_COMPONENTS: u32 = SIF_TEXTURE_COMPONENT_0 | SIF_TEXTURE_COMPONENT_1;
+
 /// Binding flags → `userPacked|comparisonSampler|...` (or hex for unknown bits).
+/// `0` for an explicit no-flags override (when the derivation would set bits).
 fn bind_flags_str(f: u32) -> String {
+    if f == 0 {
+        return String::from("0");
+    }
     let mut parts: Vec<&str> = Vec::new();
     let mut known = 0u32;
     for (bit, name) in [
-        (BIND_FLAG_USER_PACKED, "userPacked"),
-        (BIND_FLAG_USED, "used"),
-        (BIND_FLAG_COMPARISON_SAMPLER, "comparisonSampler"),
-        (BIND_FLAG_TEX_COMP_0, "texComp0"),
-        (BIND_FLAG_TEX_COMP_1, "texComp1"),
+        (SIF_USER_PACKED, "userPacked"),
+        (SIF_COMPARISON_SAMPLER, "comparisonSampler"),
+        (SIF_TEXTURE_COMPONENT_0, "texComp0"),
+        (SIF_TEXTURE_COMPONENT_1, "texComp1"),
+        (SIF_UNUSED, "unused"),
     ] {
         if f & bit != 0 {
             parts.push(name);
@@ -241,11 +254,11 @@ fn bind_flags_from(s: &str) -> Option<u32> {
     let mut f = 0u32;
     for tok in s.split('|') {
         f |= match tok {
-            "userPacked" => BIND_FLAG_USER_PACKED,
-            "used" => BIND_FLAG_USED,
-            "comparisonSampler" => BIND_FLAG_COMPARISON_SAMPLER,
-            "texComp0" => BIND_FLAG_TEX_COMP_0,
-            "texComp1" => BIND_FLAG_TEX_COMP_1,
+            "userPacked" => SIF_USER_PACKED,
+            "comparisonSampler" => SIF_COMPARISON_SAMPLER,
+            "texComp0" => SIF_TEXTURE_COMPONENT_0,
+            "texComp1" => SIF_TEXTURE_COMPONENT_1,
+            "unused" => SIF_UNUSED,
             other => {
                 let other = other.strip_prefix("0x").unwrap_or(other);
                 u32::from_str_radix(other, 16).ok()?
@@ -253,6 +266,16 @@ fn bind_flags_from(s: &str) -> Option<u32> {
         };
     }
     Some(f)
+}
+
+/// Binding flags derivable from the declaration: textures/UAVs encode their
+/// (4-component `float4`/etc.) return width in the texture-component bits.
+fn derived_binding_flags(input_type: u32, return_type: u32) -> u32 {
+    if (input_type == 2 || input_type == 4) && return_type != 0 {
+        SIF_TEX_COMPONENTS // 4 components → (4-1) → both texComp bits
+    } else {
+        0
+    }
 }
 
 /// Texture/UAV dimension → HLSL type stem.
@@ -429,7 +452,8 @@ fn emit_binding(o: &mut String, b: &ResourceBinding<'_>, rd: &ResourceDef<'_>) -
     } else if b.num_samples != 0 {
         let _ = write!(o, " samples={}", b.num_samples);
     }
-    if b.flags != 0 {
+    // Tag flags only when they differ from what the declaration implies.
+    if b.flags != derived_binding_flags(b.input_type, b.return_type) {
         let _ = write!(o, " flags={}", bind_flags_str(b.flags));
     }
     o.push_str(";\n");
@@ -851,7 +875,7 @@ fn parse_binding(line: &str) -> Option<ResourceBinding<'static>> {
     };
     let flags = match m.get("flags") {
         Some(s) => bind_flags_from(s)?,
-        None => 0,
+        None => derived_binding_flags(input_type, return_type),
     };
     Some(ResourceBinding {
         name: Cow::Owned(String::from(name)),
