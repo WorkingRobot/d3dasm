@@ -672,10 +672,12 @@ fn place_type<'a>(
     out: &mut Vec<u8>,
     pool: &mut alloc::collections::BTreeMap<alloc::string::String, u32>,
     placed: &mut Vec<(TypeDesc<'a>, u32)>,
+    member_pool: &mut Vec<(TypeDesc<'a>, u32)>,
     td: &TypeDesc<'a>,
     is_sm5: bool,
+    dedup: bool,
 ) -> u32 {
-    if td.elements == 0 {
+    if dedup && td.elements == 0 {
         if let Some((_, off)) = placed.iter().find(|(t, _)| t == td) {
             return *off;
         }
@@ -691,10 +693,21 @@ fn place_type<'a>(
     let member_off = if td.members.is_empty() {
         0u32
     } else {
+        // Member type descriptors dedup in a pool shared across all structs,
+        // but separate from top-level types (fxc never shares the two).
         let mut child_offsets = Vec::with_capacity(td.members.len());
         for m in &td.members {
             intern(out, pool, &m.name);
-            child_offsets.push(place_type(out, pool, placed, &m.member_type, is_sm5));
+            let mut nested: Vec<(TypeDesc<'_>, u32)> = Vec::new();
+            child_offsets.push(place_type(
+                out,
+                pool,
+                member_pool,
+                &mut nested,
+                &m.member_type,
+                is_sm5,
+                true,
+            ));
         }
         pad4(out);
         let moff = out.len() as u32;
@@ -723,7 +736,9 @@ fn place_type<'a>(
         }
         push_u32(out, name_off);
     }
-    placed.push((td.clone(), off));
+    if dedup {
+        placed.push((td.clone(), off));
+    }
     off
 }
 
@@ -811,6 +826,7 @@ impl ChunkWriter for ResourceDef<'_> {
 
         // Per cbuffer: variable descriptors, then per-variable name/type/default.
         let mut placed_types: Vec<(TypeDesc<'_>, u32)> = Vec::new();
+        let mut member_types: Vec<(TypeDesc<'_>, u32)> = Vec::new();
         for (ci, cb) in self.constant_buffers.iter().enumerate() {
             pad4(&mut out);
             let var_section = out.len() as u32;
@@ -839,7 +855,17 @@ impl ChunkWriter for ResourceDef<'_> {
             for (vi, v) in cb.variables.iter().enumerate() {
                 let noff = intern(&mut out, &mut vpool, &v.name);
                 patch_u32(&mut out, name_pos[vi], noff);
-                let toff = place_type(&mut out, &mut vpool, &mut placed_types, &v.var_type, is_sm5);
+                // Types in resource cbuffers (kind != 0, e.g. structured-buffer
+                // `$Element`) are placed fresh, not deduped against regular ones.
+                let toff = place_type(
+                    &mut out,
+                    &mut vpool,
+                    &mut placed_types,
+                    &mut member_types,
+                    &v.var_type,
+                    is_sm5,
+                    cb.cb_type == 0,
+                );
                 patch_u32(&mut out, type_pos[vi], toff);
                 if v.default_value.is_empty() {
                     patch_u32(&mut out, def_pos[vi], 0);
@@ -875,10 +901,28 @@ impl ChunkWriter for ResourceDef<'_> {
 pub fn rdef_to_text(rd: &ResourceDef<'_>) -> Option<alloc::string::String> {
     use core::fmt::Write as _;
 
+    fn write_type(o: &mut alloc::string::String, t: &TypeDesc<'_>) {
+        let _ = write!(
+            o,
+            " class={} base={} rows={} cols={} elements={}",
+            t.class, t.var_type, t.rows, t.columns, t.elements
+        );
+        if !t.name.is_empty() {
+            let _ = write!(o, " typename={}", t.name);
+        }
+        if let Some(e) = &t.sm5_extra {
+            let _ = write!(o, " sm5={:x},{:x},{:x},{:x}", e[0], e[1], e[2], e[3]);
+        }
+    }
+
+    // Nested struct members (a member whose own type has members) are not yet
+    // supported by the text codec; defer those RDEFs to raw hex.
     for cb in &rd.constant_buffers {
         for v in &cb.variables {
-            if !v.var_type.members.is_empty() {
-                return None;
+            for m in &v.var_type.members {
+                if !m.member_type.members.is_empty() {
+                    return None;
+                }
             }
         }
     }
@@ -909,18 +953,12 @@ pub fn rdef_to_text(rd: &ResourceDef<'_>) -> Option<alloc::string::String> {
             cb.name, cb.size, cb.flags, cb.cb_type
         );
         for v in &cb.variables {
-            let t = &v.var_type;
             let _ = write!(
                 o,
-                "  var {} offset={} size={} flags={:x} class={} base={} rows={} cols={} elements={}",
-                v.name, v.offset, v.size, v.flags, t.class, t.var_type, t.rows, t.columns, t.elements
+                "  var {} offset={} size={} flags={:x}",
+                v.name, v.offset, v.size, v.flags
             );
-            if !t.name.is_empty() {
-                let _ = write!(o, " typename={}", t.name);
-            }
-            if let Some(e) = &t.sm5_extra {
-                let _ = write!(o, " sm5={:x},{:x},{:x},{:x}", e[0], e[1], e[2], e[3]);
-            }
+            write_type(&mut o, &v.var_type);
             if let Some(ts) = v.texture_start {
                 let _ = write!(o, " tex={},{}", ts as i32, v.texture_size.unwrap_or(0));
             }
@@ -934,6 +972,11 @@ pub fn rdef_to_text(rd: &ResourceDef<'_>) -> Option<alloc::string::String> {
                 }
             }
             let _ = writeln!(o);
+            for m in &v.var_type.members {
+                let _ = write!(o, "    member {} offset={}", m.name, m.offset);
+                write_type(&mut o, &m.member_type);
+                let _ = writeln!(o);
+            }
         }
     }
     Some(o)
@@ -973,6 +1016,32 @@ pub fn rdef_from_text(text: &str) -> Option<ResourceDef<'static>> {
             i += 2;
         }
         Some(out)
+    }
+    fn parse_type(m: &BTreeMap<&str, &str>) -> Option<TypeDesc<'static>> {
+        let sm5_extra = match m.get("sm5") {
+            Some(s) => {
+                let mut it = s.split(',');
+                let mut a = [0u32; 4];
+                for slot in &mut a {
+                    *slot = u32::from_str_radix(it.next()?, 16).ok()?;
+                }
+                Some(a)
+            }
+            None => None,
+        };
+        Some(TypeDesc {
+            class: dec(m, "class")? as u16,
+            var_type: dec(m, "base")? as u16,
+            rows: dec(m, "rows")? as u16,
+            columns: dec(m, "cols")? as u16,
+            elements: dec(m, "elements")? as u16,
+            members: Vec::new(),
+            sm5_extra,
+            name: match m.get("typename") {
+                Some(s) => Cow::Owned(String::from(*s)),
+                None => Cow::Borrowed(""),
+            },
+        })
     }
 
     let mut rd = ResourceDef {
@@ -1029,21 +1098,27 @@ pub fn rdef_from_text(text: &str) -> Option<ResourceDef<'static>> {
                     cb_type: dec(&m, "kind")?,
                 });
             }
+            "member" => {
+                let mut f = rest.split_whitespace();
+                let name = f.next()?;
+                let m = kv(f);
+                let member_type = parse_type(&m)?;
+                let offset = dec(&m, "offset")?;
+                let var = rd
+                    .constant_buffers
+                    .last_mut()?
+                    .variables
+                    .last_mut()?;
+                var.var_type.members.push(MemberDesc {
+                    name: Cow::Owned(String::from(name)),
+                    member_type,
+                    offset,
+                });
+            }
             "var" => {
                 let mut f = rest.split_whitespace();
                 let name = f.next()?;
                 let m = kv(f);
-                let sm5 = match m.get("sm5") {
-                    Some(s) => {
-                        let mut it = s.split(',');
-                        let mut a = [0u32; 4];
-                        for slot in &mut a {
-                            *slot = u32::from_str_radix(it.next()?, 16).ok()?;
-                        }
-                        Some(a)
-                    }
-                    None => None,
-                };
                 let pair = |s: &str| -> Option<(u32, u32)> {
                     let (a, b) = s.split_once(',')?;
                     Some((a.parse::<i32>().ok()? as u32, b.parse().ok()?))
@@ -1066,19 +1141,7 @@ pub fn rdef_from_text(text: &str) -> Option<ResourceDef<'static>> {
                     Some(h) => hex_bytes(h)?,
                     None => Vec::new(),
                 };
-                let var_type = TypeDesc {
-                    class: dec(&m, "class")? as u16,
-                    var_type: dec(&m, "base")? as u16,
-                    rows: dec(&m, "rows")? as u16,
-                    columns: dec(&m, "cols")? as u16,
-                    elements: dec(&m, "elements")? as u16,
-                    members: Vec::new(),
-                    sm5_extra: sm5,
-                    name: match m.get("typename") {
-                        Some(s) => Cow::Owned(String::from(*s)),
-                        None => Cow::Borrowed(""),
-                    },
-                };
+                let var_type = parse_type(&m)?;
                 let cb = rd.constant_buffers.last_mut()?;
                 cb.variables.push(CBufferVariable {
                     name: Cow::Owned(String::from(name)),
