@@ -165,10 +165,13 @@ fn write_operand(w: &mut String, op: &Operand, imm_type: ImmediateType) {
     if op.abs {
         w.push('|');
     }
+    // Inline immediates `l(...)` / `d(...)` only when un-indexed. An immediate
+    // that carries indices (a degenerate but decodable state) is emitted
+    // register-style (prefix + indices) by the `_` arm below.
+    let inline_imm =
+        matches!(op.reg_type, RegisterType::Immediate32 | RegisterType::Immediate64)
+            && op.indices.is_empty();
     match op.reg_type {
-        // Inline immediates `l(...)` / `d(...)` only when un-indexed. An
-        // immediate that carries indices (a degenerate but decodable state) is
-        // emitted register-style (prefix + indices) by the `_` arm below.
         RegisterType::Immediate32 if op.indices.is_empty() => {
             write_immediates(w, 'l', &op.immediate_values, imm_type)
         }
@@ -186,7 +189,11 @@ fn write_operand(w: &mut String, op: &Operand, imm_type: ImmediateType) {
             write_indices(w, &op.indices);
         }
     }
-    write_components(w, &op.components);
+    // A scalar immediate's 1-component selection (`.1`) is implied — omit it
+    // (the parser restores it for any bare inline immediate).
+    if !(inline_imm && matches!(op.components, ComponentSelect::OneComponent)) {
+        write_components(w, &op.components);
+    }
     if op.abs {
         w.push('|');
     }

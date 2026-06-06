@@ -719,7 +719,12 @@ fn parse_operand(c: &mut Cursor) -> Result<Operand, AsmError> {
         (reg_type, indices, SmallVec::new())
     };
 
-    let components = parse_components(c)?;
+    let mut components = parse_components(c)?;
+    // A bare inline immediate is 1-component — the `.1` is omitted on write
+    // (immediates are only ever 1-component or masked, never 0-component).
+    if !immediate_values.is_empty() && matches!(components, ComponentSelect::ZeroComponent) {
+        components = ComponentSelect::OneComponent;
+    }
     if abs && !c.eat_byte(b'|') {
         return err("expected closing '|' for abs operand");
     }
