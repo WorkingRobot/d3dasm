@@ -1,0 +1,339 @@
+//! Full-container `.d3dasm` document: forensic metadata header + every chunk,
+//! such that a container disassembles and reassembles byte-identically.
+//!
+//! Layout (after the `//` forensic header, which is ignored on parse):
+//! ```text
+//! .dxbc version=1 hash=<32 hex>
+//! .code SHEX            ; editable shader program (lossless disassembly body)
+//! ps_5_0
+//! ...
+//! .chunk RDEF           ; every other chunk, raw bytes as hex (32/line)
+//!   0a0b0c...
+//! .end
+//! ```
+//! `.code <fourcc>` bodies are assembled via [`dxbc::shex::assemble`] and
+//! re-encoded; `.chunk <fourcc>` bodies are raw hex. The container is rebuilt
+//! with [`dxbc::container::build_dxbc_with_header`], preserving the original
+//! version and 16-byte header hash.
+
+use alloc::format;
+use alloc::string::String;
+use alloc::vec::Vec;
+use core::fmt::Write;
+
+use dxbc::AsmError;
+use dxbc::chunks::WritableChunk;
+
+use crate::{Shader, forensic};
+
+const HEX_PER_LINE: usize = 32;
+
+/// Serialize a whole DXBC container to a forensic `.d3dasm` document.
+pub fn serialize(shader: &Shader) -> String {
+    let mut out = String::new();
+    forensic::write_metadata_header(&mut out, shader);
+
+    let container = shader.container();
+    // The header hash is recomputed on reassembly (see `assemble`), so it is
+    // not part of the directive — the original is recorded in the comment above.
+    out.push_str(".dxbc version=");
+    let _ = write!(out, "{}", container.version);
+    out.push('\n');
+
+    for chunk in &container.chunks {
+        // A chunk becomes an editable `.code` block only when we have a text
+        // codec for it AND that codec is verified to round-trip these exact
+        // bytes (see `chunk_to_body`); otherwise it is preserved as raw hex.
+        if let Some(body) = chunk_to_body(chunk.fourcc, chunk.data) {
+            let _ = writeln!(out, ".code {}", chunk.fourcc_str());
+            out.push_str(&body);
+        } else {
+            let _ = writeln!(out, ".chunk {}", chunk.fourcc_str());
+            write_hex_block(&mut out, chunk.data);
+        }
+    }
+
+    out.push_str(".end\n");
+    out
+}
+
+// ---------------------------------------------------------------------------
+// Per-chunk text codecs. A chunk is emitted as an editable `.code` block only
+// when `chunk_to_body` confirms its text round-trips to the exact bytes.
+// ---------------------------------------------------------------------------
+
+const SIGNATURE_FOURCCS: &[&[u8; 4]] = &[b"ISGN", b"ISG1", b"OSGN", b"OSG1", b"OSG5", b"PCSG", b"PSG1"];
+
+/// Editable text for a chunk, if a codec exists for its FourCC.
+fn encode_to_text(fourcc: [u8; 4], data: &[u8]) -> Option<String> {
+    if &fourcc == b"SHEX" || &fourcc == b"SHDR" {
+        let program = dxbc::shex::decode_with_fourcc(data, fourcc).ok()?;
+        return Some(dxbc::shex::serialize(&program));
+    }
+    if SIGNATURE_FOURCCS.contains(&&fourcc) {
+        let fs = core::str::from_utf8(&fourcc).ok()?;
+        let sig = dxbc::chunks::signature::Signature {
+            fourcc,
+            elements: dxbc::chunks::signature::parse_signature(fs, data),
+        };
+        return Some(dxbc::chunks::signature::signature_to_text(&sig));
+    }
+    if &fourcc == b"STAT" {
+        let stats = dxbc::chunks::stat::parse_stat(data)?;
+        return Some(dxbc::chunks::stat::stat_to_text(&stats));
+    }
+    None
+}
+
+/// Encode an editable chunk body back to raw chunk bytes.
+fn body_to_chunk(fourcc: [u8; 4], body: &str) -> Result<Vec<u8>, AsmError> {
+    if &fourcc == b"SHEX" || &fourcc == b"SHDR" {
+        let program = dxbc::shex::assemble(body)?;
+        return Ok(dxbc::shex::encode(&program));
+    }
+    if SIGNATURE_FOURCCS.contains(&&fourcc) {
+        let sig = dxbc::chunks::signature::signature_from_text(fourcc, body)
+            .ok_or_else(|| err("malformed signature text"))?;
+        return Ok(dxbc::chunks::signature::write_signature(fourcc, &sig.elements).data);
+    }
+    if &fourcc == b"STAT" {
+        use dxbc::chunks::ChunkWriter;
+        let stats =
+            dxbc::chunks::stat::stat_from_text(body).ok_or_else(|| err("malformed stat text"))?;
+        return Ok(stats.to_writable().data);
+    }
+    Err(err("no text codec for chunk"))
+}
+
+/// Editable body for a chunk, but only when re-encoding it reproduces the
+/// original bytes exactly — so an imperfect codec silently falls back to raw
+/// hex and byte-identity is never at risk.
+fn chunk_to_body(fourcc: [u8; 4], data: &[u8]) -> Option<String> {
+    let body = encode_to_text(fourcc, data)?;
+    let rebuilt = body_to_chunk(fourcc, &body).ok()?;
+    if rebuilt == data { Some(body) } else { None }
+}
+
+fn write_hex_block(out: &mut String, data: &[u8]) {
+    for row in data.chunks(HEX_PER_LINE) {
+        out.push_str("  ");
+        for b in row {
+            let _ = write!(out, "{b:02x}");
+        }
+        out.push('\n');
+    }
+}
+
+/// Assemble a forensic `.d3dasm` document back into byte-identical container
+/// bytes. Expects a `.dxbc` directive (produced by [`serialize`]).
+pub fn assemble(text: &str) -> Result<Vec<u8>, AsmError> {
+    // Strip `//` comments and blanks (mirrors shex::assemble).
+    let lines: Vec<&str> = text
+        .lines()
+        .map(|l| l.split("//").next().unwrap_or(l).trim())
+        .filter(|l| !l.is_empty())
+        .collect();
+
+    let mut idx = 0;
+    let header = lines.first().ok_or_else(|| err("empty container document"))?;
+    let version = parse_dxbc_directive(header)?;
+    idx += 1;
+
+    let mut chunks: Vec<WritableChunk> = Vec::new();
+    while idx < lines.len() {
+        let line = lines[idx];
+        if line == ".end" {
+            break;
+        }
+        if let Some(fourcc) = line.strip_prefix(".code ") {
+            let fourcc = parse_fourcc(fourcc.trim())?;
+            idx += 1;
+            let mut body = String::new();
+            while idx < lines.len() && !lines[idx].starts_with('.') {
+                body.push_str(lines[idx]);
+                body.push('\n');
+                idx += 1;
+            }
+            chunks.push(WritableChunk {
+                fourcc,
+                data: body_to_chunk(fourcc, &body)?,
+            });
+        } else if let Some(fourcc) = line.strip_prefix(".chunk ") {
+            let fourcc = parse_fourcc(fourcc.trim())?;
+            idx += 1;
+            let mut hex = String::new();
+            while idx < lines.len() && !lines[idx].starts_with('.') {
+                hex.push_str(lines[idx]);
+                idx += 1;
+            }
+            chunks.push(WritableChunk {
+                fourcc,
+                data: hex_decode(&hex)?,
+            });
+        } else {
+            return Err(err(format!("unexpected directive: {line:?}")));
+        }
+    }
+
+    // Build, then recompute the header checksum over the assembled content so
+    // edited shaders carry a valid digest (and unedited ones reproduce the
+    // original, keeping byte-identity).
+    let mut bytes = dxbc::container::build_dxbc_with_header(&chunks, version, &[0u8; 16]);
+    let digest = dxbc::checksum::dxbc_checksum(&bytes[20..]);
+    bytes[4..20].copy_from_slice(&digest);
+    Ok(bytes)
+}
+
+/// Assemble a document containing one *or more* `.dxbc` containers (e.g. an
+/// archive `.bin` with many shaders) back into the concatenated container
+/// bytes. Each `.dxbc` directive starts a new container.
+pub fn assemble_all(text: &str) -> Result<Vec<u8>, AsmError> {
+    let mut out = Vec::new();
+    let mut current: Option<String> = None;
+    for raw in text.lines() {
+        let stripped = raw.split("//").next().unwrap_or(raw).trim();
+        if stripped.starts_with(".dxbc") {
+            if let Some(doc) = current.take() {
+                out.extend_from_slice(&assemble(&doc)?);
+            }
+            current = Some(String::new());
+        }
+        if let Some(doc) = current.as_mut() {
+            doc.push_str(raw);
+            doc.push('\n');
+        }
+    }
+    if let Some(doc) = current.take() {
+        out.extend_from_slice(&assemble(&doc)?);
+    }
+    if out.is_empty() {
+        return Err(err("no .dxbc container directive found"));
+    }
+    Ok(out)
+}
+
+/// Serialize a whole input file — which may be a game archive wrapping several
+/// DXBC containers with non-container bytes around/between them — preserving
+/// **every** byte. Container regions become forensic documents; the wrapper
+/// bytes are emitted verbatim as `.raw` hex segments.
+pub fn serialize_file(data: &[u8]) -> String {
+    let shaders = crate::parse(data);
+    let mut out = String::new();
+    let mut pos = 0usize;
+    for shader in &shaders {
+        let start = shader.offset();
+        if start > pos {
+            out.push_str(".raw\n");
+            write_hex_block(&mut out, &data[pos..start]);
+        }
+        out.push_str(&serialize(shader));
+        pos = start + shader.size() as usize;
+    }
+    if pos < data.len() {
+        out.push_str(".raw\n");
+        write_hex_block(&mut out, &data[pos..]);
+    }
+    out
+}
+
+/// Reassemble a whole-file document (see [`serialize_file`]) back into the
+/// byte-identical original file, wrapper bytes and all.
+pub fn assemble_file(text: &str) -> Result<Vec<u8>, AsmError> {
+    let lines: Vec<&str> = text
+        .lines()
+        .map(|l| l.split("//").next().unwrap_or(l).trim())
+        .filter(|l| !l.is_empty())
+        .collect();
+
+    let mut out = Vec::new();
+    let mut idx = 0;
+    while idx < lines.len() {
+        let line = lines[idx];
+        if line == ".raw" {
+            idx += 1;
+            let mut hex = String::new();
+            while idx < lines.len() && !lines[idx].starts_with('.') {
+                hex.push_str(lines[idx]);
+                idx += 1;
+            }
+            out.extend_from_slice(&hex_decode(&hex)?);
+        } else if line.starts_with(".dxbc") {
+            // Collect this container document up to and including its `.end`.
+            let mut doc = String::new();
+            doc.push_str(lines[idx]);
+            doc.push('\n');
+            idx += 1;
+            while idx < lines.len() {
+                let is_end = lines[idx] == ".end";
+                doc.push_str(lines[idx]);
+                doc.push('\n');
+                idx += 1;
+                if is_end {
+                    break;
+                }
+            }
+            out.extend_from_slice(&assemble(&doc)?);
+        } else {
+            return Err(err(format!("unexpected directive: {line:?}")));
+        }
+    }
+    Ok(out)
+}
+
+/// True if `text` is a container document (vs. a bare program disassembly).
+pub fn is_container(text: &str) -> bool {
+    text.lines()
+        .map(|l| l.split("//").next().unwrap_or(l).trim())
+        .find(|l| !l.is_empty())
+        .map(|l| l.starts_with(".dxbc"))
+        .unwrap_or(false)
+}
+
+fn parse_dxbc_directive(line: &str) -> Result<u32, AsmError> {
+    // `.dxbc version=N`. The header hash is always recomputed on reassembly,
+    // so it is not carried in the directive.
+    for tok in line.split_whitespace() {
+        if let Some(v) = tok.strip_prefix("version=") {
+            return v.parse::<u32>().map_err(|_| err("bad version"));
+        }
+    }
+    Err(err("malformed .dxbc directive (missing version=)"))
+}
+
+fn parse_fourcc(s: &str) -> Result<[u8; 4], AsmError> {
+    let b = s.as_bytes();
+    if b.len() != 4 {
+        return Err(err(format!("fourcc must be 4 bytes: {s:?}")));
+    }
+    Ok([b[0], b[1], b[2], b[3]])
+}
+
+fn hex_decode(s: &str) -> Result<Vec<u8>, AsmError> {
+    let s = s.trim();
+    if s.len() % 2 != 0 {
+        return Err(err("hex block has odd length"));
+    }
+    let bytes = s.as_bytes();
+    let mut out = Vec::with_capacity(s.len() / 2);
+    let mut i = 0;
+    while i < bytes.len() {
+        let hi = hex_nibble(bytes[i])?;
+        let lo = hex_nibble(bytes[i + 1])?;
+        out.push((hi << 4) | lo);
+        i += 2;
+    }
+    Ok(out)
+}
+
+fn hex_nibble(b: u8) -> Result<u8, AsmError> {
+    match b {
+        b'0'..=b'9' => Ok(b - b'0'),
+        b'a'..=b'f' => Ok(b - b'a' + 10),
+        b'A'..=b'F' => Ok(b - b'A' + 10),
+        _ => Err(err("bad hex digit")),
+    }
+}
+
+fn err(msg: impl Into<String>) -> AsmError {
+    AsmError { message: msg.into() }
+}

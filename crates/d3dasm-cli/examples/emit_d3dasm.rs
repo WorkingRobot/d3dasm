@@ -1,9 +1,9 @@
-//! Emit lossless `.d3dasm` text for every shader program in the input files.
+//! Emit a full forensic `.d3dasm` document for every DXBC container in the
+//! input files.
 //!
-//! Each `.bin` may be an archive of many DXBC containers; one `.d3dasm` file is
-//! written per shader program, named `<stem>.<NN>.<profile>.d3dasm`. Every file
-//! is verified on the way out (assemble -> encode must reproduce the original
-//! chunk bytes).
+//! Each `.bin` may be an archive of many containers; one `.d3dasm` file is
+//! written per container, named `<stem>.<NN>.<profile>.d3dasm`. Every file is
+//! verified on the way out (assemble must reproduce the original container bytes).
 //!
 //! Usage: cargo run --release --example emit_d3dasm -- <out_dir> <files...>
 
@@ -11,9 +11,7 @@ use std::path::Path;
 
 fn main() {
     let mut args = std::env::args().skip(1);
-    let out_dir = args
-        .next()
-        .expect("usage: emit_d3dasm <out_dir> <files...>");
+    let out_dir = args.next().expect("usage: emit_d3dasm <out_dir> <files...>");
     std::fs::create_dir_all(&out_dir).expect("create out dir");
 
     let mut emitted = 0usize;
@@ -32,27 +30,23 @@ fn main() {
             .map(|s| s.to_string_lossy().into_owned())
             .unwrap_or_else(|| "shader".into());
 
-        let shaders = d3dasm::parse(&data);
-        let mut idx = 0usize;
-        for shader in &shaders {
-            let Some(prog) = shader.program() else {
-                continue;
-            };
+        for (idx, shader) in d3dasm::parse(&data).iter().enumerate() {
+            let text = d3dasm::container_doc::serialize(shader);
 
-            let text = dxbc::serialize(prog);
-            let original = dxbc::shex::encode(prog);
-
-            // Verify the emitted text re-assembles to the same bytes.
-            let verified = dxbc::assemble(&text)
-                .map(|p| dxbc::shex::encode(&p) == original)
+            // Verify the document reassembles to the original container bytes.
+            let start = shader.offset();
+            let original = &data[start..start + shader.size() as usize];
+            let verified = d3dasm::container_doc::assemble(&text)
+                .map(|b| b == original)
                 .unwrap_or(false);
 
-            let profile = format!(
-                "{}_{}_{}",
-                prog.shader_type, prog.major_version, prog.minor_version
-            );
+            let profile = shader
+                .program()
+                .map(|p| format!("{}_{}_{}", p.shader_type, p.major_version, p.minor_version))
+                .unwrap_or_else(|| "nocode".into());
             let name = format!("{stem}.{idx:02}.{profile}.d3dasm");
             let path = Path::new(&out_dir).join(&name);
+
             if let Err(e) = std::fs::write(&path, &text) {
                 eprintln!("write {}: {e}", path.display());
                 failed += 1;
@@ -62,7 +56,6 @@ fn main() {
             } else {
                 emitted += 1;
             }
-            idx += 1;
         }
     }
 

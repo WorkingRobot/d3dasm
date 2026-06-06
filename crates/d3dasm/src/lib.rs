@@ -37,6 +37,11 @@ use dxbc::container::DxbcContainer;
 /// Re-export the DXBC backend for callers that need lower-level access.
 pub use dxbc;
 
+/// Full-container `.d3dasm` document: forensic disassembly + byte-identical
+/// reassembly of an entire DXBC container.
+pub mod container_doc;
+mod forensic;
+
 /// A parsed DXBC shader container with typed chunk access and formatting.
 ///
 /// Created by [`parse`] or [`Shader::from_container`]. Chunks are parsed

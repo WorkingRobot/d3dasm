@@ -6,16 +6,17 @@ use clap::Parser;
 
 /// Direct3D shader bytecode disassembler and `.d3dasm` assembler.
 ///
-/// Default mode disassembles a DXBC binary. With `--emit d3dasm` it writes the
-/// lossless `.d3dasm` text format; with `--assemble` it reads a `.d3dasm` file
-/// and re-encodes it to a SHEX shader chunk (byte-identical to the original).
+/// Default mode disassembles a DXBC binary to human text. `--emit d3dasm`
+/// writes the full forensic `.d3dasm` document (metadata header + every chunk,
+/// shader program editable); `--assemble` rebuilds the byte-identical DXBC
+/// container(s) from a `.d3dasm` document.
 #[derive(Parser)]
 #[command(name = "d3dasm", version, about)]
 struct Cli {
     /// Input file: a DXBC binary, or a `.d3dasm` text file with `--assemble`.
     file: PathBuf,
 
-    /// Assemble a `.d3dasm` file back into raw SHEX shader-chunk bytecode.
+    /// Assemble a `.d3dasm` document back into the byte-identical DXBC container(s).
     #[arg(long)]
     assemble: bool,
 
@@ -72,17 +73,10 @@ fn disassemble(cli: &Cli) -> Result<(), String> {
             }
         }
         "d3dasm" => {
-            let mut programs = shaders.iter().filter_map(|s| s.program());
-            let program = programs
-                .next()
-                .ok_or("input has no shader program (SHEX/SHDR chunk) to serialize")?;
-            if programs.next().is_some() {
-                return Err(
-                    "input has multiple shader programs; .d3dasm represents a single program"
-                        .into(),
-                );
-            }
-            out.push_str(&d3dasm::dxbc::serialize(program));
+            // Whole-file forensic document: a container document per DXBC
+            // container, plus `.raw` segments for any archive/wrapper bytes
+            // around them, so the entire file reassembles byte-identically.
+            out.push_str(&d3dasm::container_doc::serialize_file(&data));
         }
         other => {
             return Err(format!(
@@ -94,12 +88,11 @@ fn disassemble(cli: &Cli) -> Result<(), String> {
     write_out(cli.output.as_deref(), out.as_bytes())
 }
 
-/// Assemble a `.d3dasm` text file into raw SHEX shader-chunk bytecode.
+/// Assemble a `.d3dasm` document back into byte-identical DXBC container(s).
 fn assemble(cli: &Cli) -> Result<(), String> {
     let text = std::fs::read_to_string(&cli.file)
         .map_err(|e| format!("Error reading {}: {e}", cli.file.display()))?;
-    let program = d3dasm::dxbc::assemble(&text).map_err(|e| e.to_string())?;
-    let bytes = d3dasm::dxbc::shex::encode(&program);
+    let bytes = d3dasm::container_doc::assemble_file(&text).map_err(|e| e.to_string())?;
     write_out(cli.output.as_deref(), &bytes)
 }
 

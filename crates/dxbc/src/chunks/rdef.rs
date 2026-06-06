@@ -758,13 +758,19 @@ impl ChunkWriter for ResourceDef<'_> {
         let total_size = string_table_base + st.len();
         let mut out = Vec::with_capacity(total_size);
 
-        // Offsets for header
+        // Offsets for header. `binding_offset` always points at the (possibly
+        // empty) binding section; `cb_offset` is 0 when there are no cbuffers.
         let binding_offset = header_size + rd11_size;
         let cb_offset = binding_offset + bindings_size;
+        let cb_offset_field = if self.constant_buffers.is_empty() {
+            0
+        } else {
+            cb_offset as u32
+        };
 
         // Write header (28 bytes)
         out.extend_from_slice(&(self.constant_buffers.len() as u32).to_le_bytes());
-        out.extend_from_slice(&(cb_offset as u32).to_le_bytes());
+        out.extend_from_slice(&cb_offset_field.to_le_bytes());
         out.extend_from_slice(&(self.bindings.len() as u32).to_le_bytes());
         out.extend_from_slice(&(binding_offset as u32).to_le_bytes());
         out.extend_from_slice(&self.target_version.to_le_bytes());

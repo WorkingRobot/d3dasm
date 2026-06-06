@@ -14,6 +14,11 @@ pub struct DxbcContainer<'a> {
     pub offset_in_file: usize,
     /// Total size of the container in bytes (from the DXBC header).
     pub total_size: u32,
+    /// The 16-byte container header digest (bytes 4..20), preserved so the
+    /// container can be rebuilt byte-identically.
+    pub header_hash: [u8; 16],
+    /// Container format version (header bytes 20..24; normally 1).
+    pub version: u32,
     /// Parsed chunk entries.
     pub chunks: Vec<DxbcChunk<'a>>,
 }
@@ -82,7 +87,11 @@ fn parse_dxbc<'a>(data: &'a [u8], offset: usize) -> Option<DxbcContainer<'a>> {
     }
 
     let mut c = SliceCursor::new(data);
-    c.seek(SeekFrom::Start((offset + 0x18) as u64)).ok()?;
+    // Header: magic(4) hash(16) version(4) total_size(4) chunk_count(4).
+    let mut header_hash = [0u8; 16];
+    header_hash.copy_from_slice(&data[offset + 4..offset + 20]);
+    c.seek(SeekFrom::Start((offset + 0x14) as u64)).ok()?;
+    let version = c.read_u32_le().ok()?;
     let total_size = c.read_u32_le().ok()?;
     let chunk_count = c.read_u32_le().ok()? as usize;
 
@@ -117,6 +126,8 @@ fn parse_dxbc<'a>(data: &'a [u8], offset: usize) -> Option<DxbcContainer<'a>> {
     Some(DxbcContainer {
         offset_in_file: offset,
         total_size,
+        header_hash,
+        version,
         chunks,
     })
 }
@@ -128,16 +139,26 @@ fn parse_dxbc<'a>(data: &'a [u8], offset: usize) -> Option<DxbcContainer<'a>> {
 /// followed by the chunk offset table and chunk entries.
 ///
 /// The 16-byte hash field is left zeroed — computing the DXBC hash is a
-/// separate concern (typically only the GPU runtime validates it).
+/// separate concern (typically only the GPU runtime validates it). Use
+/// [`build_dxbc_with_header`] to preserve an existing hash/version for
+/// byte-identical reconstruction.
 pub fn build_dxbc(chunks: &[WritableChunk]) -> Vec<u8> {
+    build_dxbc_with_header(chunks, 1, &[0u8; 16])
+}
+
+/// Build a DXBC container, preserving the given format `version` and 16-byte
+/// header `hash`. The inverse of [`scan_dxbc`] for a single container: feeding
+/// a parsed container's chunks plus its `version`/`header_hash` reproduces the
+/// original bytes (for the standard contiguous chunk layout).
+pub fn build_dxbc_with_header(chunks: &[WritableChunk], version: u32, hash: &[u8; 16]) -> Vec<u8> {
     let header_size = 0x20 + chunks.len() * 4;
     let chunks_total: usize = chunks.iter().map(|c| 8 + c.data.len()).sum();
     let total_size = header_size + chunks_total;
 
     let mut buf = Vec::with_capacity(total_size);
     buf.extend_from_slice(b"DXBC");
-    buf.extend_from_slice(&[0u8; 16]); // hash placeholder
-    buf.extend_from_slice(&1u32.to_le_bytes()); // version
+    buf.extend_from_slice(hash);
+    buf.extend_from_slice(&version.to_le_bytes());
     buf.extend_from_slice(&(total_size as u32).to_le_bytes());
     buf.extend_from_slice(&(chunks.len() as u32).to_le_bytes());
 

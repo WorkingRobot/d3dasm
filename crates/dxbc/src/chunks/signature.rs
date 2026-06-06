@@ -1,8 +1,10 @@
 //! Input/output/patch-constant signature parsing (ISGN, OSGN, PCSG, ISG1, OSG1, PSG1).
 
 use alloc::borrow::Cow;
+use alloc::string::String;
 use alloc::vec::Vec;
 use core::fmt;
+use core::fmt::Write as _;
 
 use super::{ChunkWriter, WritableChunk};
 
@@ -387,6 +389,84 @@ pub fn parse_signature<'a>(fourcc: &str, data: &'a [u8]) -> Vec<SignatureElement
     elements
 }
 
+/// Serialize a signature to an editable text form: one element per line,
+/// `name index sysval type reg mask rwmask [stream] [minprec]` (mask fields in
+/// hex). `name` is `-` for an empty semantic. Trailing fields appear only for
+/// the versions that carry them.
+pub fn signature_to_text(sig: &Signature) -> String {
+    let fourcc_str = core::str::from_utf8(&sig.fourcc).unwrap_or("ISGN");
+    let ver = SignatureVersion::from_fourcc(fourcc_str);
+    let mut out = String::new();
+    for e in &sig.elements {
+        let name = if e.semantic_name.is_empty() {
+            "-"
+        } else {
+            &e.semantic_name
+        };
+        let _ = write!(
+            out,
+            "{name} {} {} {} {} {:02x} {:02x}",
+            e.semantic_index, e.system_value, e.component_type, e.register, e.mask, e.rw_mask
+        );
+        if ver.has_stream() {
+            let _ = write!(out, " {}", e.stream.unwrap_or(0));
+        }
+        if ver.has_min_precision() {
+            let _ = write!(out, " {}", e.min_precision.map_or(0, |mp| mp.to_u32()));
+        }
+        out.push('\n');
+    }
+    out
+}
+
+/// Parse the editable text form produced by [`signature_to_text`].
+pub fn signature_from_text(fourcc: [u8; 4], text: &str) -> Option<Signature<'static>> {
+    let fourcc_str = core::str::from_utf8(&fourcc).unwrap_or("ISGN");
+    let ver = SignatureVersion::from_fourcc(fourcc_str);
+    let mut elements = Vec::new();
+    for line in text.lines() {
+        let line = line.trim();
+        if line.is_empty() {
+            continue;
+        }
+        let mut f = line.split_whitespace();
+        let name = f.next()?;
+        let semantic_name = if name == "-" {
+            Cow::Owned(String::new())
+        } else {
+            Cow::Owned(String::from(name))
+        };
+        let semantic_index = f.next()?.parse().ok()?;
+        let system_value = f.next()?.parse().ok()?;
+        let component_type = f.next()?.parse().ok()?;
+        let register = f.next()?.parse().ok()?;
+        let mask = u8::from_str_radix(f.next()?, 16).ok()?;
+        let rw_mask = u8::from_str_radix(f.next()?, 16).ok()?;
+        let stream = if ver.has_stream() {
+            Some(f.next()?.parse().ok()?)
+        } else {
+            None
+        };
+        let min_precision = if ver.has_min_precision() {
+            Some(MinPrecision::from_u32(f.next()?.parse().ok()?))
+        } else {
+            None
+        };
+        elements.push(SignatureElement {
+            semantic_name,
+            semantic_index,
+            system_value,
+            component_type,
+            register,
+            mask,
+            rw_mask,
+            stream,
+            min_precision,
+        });
+    }
+    Some(Signature { fourcc, elements })
+}
+
 /// Serialize a signature chunk back to bytes.
 ///
 /// `fourcc` is the 4-byte chunk tag (e.g. `*b"ISGN"`, `*b"OSG1"`).
@@ -437,6 +517,11 @@ pub fn write_signature(fourcc: [u8; 4], elements: &[SignatureElement<'_>]) -> Wr
 
     // String table
     buf.extend_from_slice(&strings.finish());
+
+    // Pad the payload to a 4-byte boundary with 0xAB (fxc's fill byte).
+    while buf.len() % 4 != 0 {
+        buf.push(0xAB);
+    }
 
     WritableChunk { fourcc, data: buf }
 }

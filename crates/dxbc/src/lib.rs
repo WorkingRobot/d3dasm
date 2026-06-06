@@ -42,6 +42,8 @@
 #![no_std]
 extern crate alloc;
 
+/// DXBC container checksum (the modified-MD5 header digest).
+pub mod checksum;
 /// DXBC chunk parsers for every known chunk FourCC.
 pub mod chunks;
 /// DXBC container (header + chunk table) parser and writer.

@@ -1,10 +1,140 @@
 //! Parser for the STAT (statistics) chunk in DXBC shader bytecode.
 
+use alloc::string::String;
 use core::fmt;
+use core::fmt::Write as _;
 
-use nostdio::{ReadLe, Seek, SeekFrom, SliceCursor};
+use nostdio::{ReadLe, SliceCursor};
 
 use super::{ChunkParser, ChunkWriter};
+
+/// Named `(key, value)` view of every STAT counter, in payload order.
+fn stat_fields(s: &ShaderStats) -> [(&'static str, u32); 33] {
+    [
+        ("instructions", s.instruction_count),
+        ("temps", s.temp_register_count),
+        ("defines", s.define_count),
+        ("declarations", s.declaration_count),
+        ("float_ops", s.float_instruction_count),
+        ("int_ops", s.int_instruction_count),
+        ("uint_ops", s.uint_instruction_count),
+        ("static_flow", s.static_flow_control_count),
+        ("dynamic_flow", s.dynamic_flow_control_count),
+        ("macros", s.macro_instruction_count),
+        ("temp_arrays", s.temp_array_count),
+        ("array_ops", s.array_instruction_count),
+        ("cuts", s.cut_instruction_count),
+        ("emits", s.emit_instruction_count),
+        ("tex_normal", s.texture_normal_instructions),
+        ("tex_load", s.texture_load_instructions),
+        ("tex_comp", s.texture_comp_instructions),
+        ("tex_bias", s.texture_bias_instructions),
+        ("tex_gradient", s.texture_gradient_instructions),
+        ("movs", s.mov_instruction_count),
+        ("movcs", s.movc_instruction_count),
+        ("conversions", s.conversion_instruction_count),
+        ("gs_input_prim", s.gs_input_primitive),
+        ("gs_output_topo", s.gs_output_topology),
+        ("gs_max_verts", s.gs_max_output_vertex_count),
+        ("gs_instances", s.gs_instance_count),
+        ("hs_control_points", s.hs_control_points),
+        ("hs_output_prim", s.hs_output_primitive),
+        ("hs_partitioning", s.hs_partitioning),
+        ("ds_domain", s.ds_tessellator_domain),
+        ("barriers", s.barrier_instructions),
+        ("interlocked", s.interlocked_instructions),
+        ("tex_store", s.texture_store_instructions),
+    ]
+}
+
+impl ShaderStats {
+    /// Assign a STAT field by its text key. Returns `false` for unknown keys.
+    fn set_field(&mut self, key: &str, v: u32) -> bool {
+        match key {
+            "instructions" => self.instruction_count = v,
+            "temps" => self.temp_register_count = v,
+            "defines" => self.define_count = v,
+            "declarations" => self.declaration_count = v,
+            "float_ops" => self.float_instruction_count = v,
+            "int_ops" => self.int_instruction_count = v,
+            "uint_ops" => self.uint_instruction_count = v,
+            "static_flow" => self.static_flow_control_count = v,
+            "dynamic_flow" => self.dynamic_flow_control_count = v,
+            "macros" => self.macro_instruction_count = v,
+            "temp_arrays" => self.temp_array_count = v,
+            "array_ops" => self.array_instruction_count = v,
+            "cuts" => self.cut_instruction_count = v,
+            "emits" => self.emit_instruction_count = v,
+            "tex_normal" => self.texture_normal_instructions = v,
+            "tex_load" => self.texture_load_instructions = v,
+            "tex_comp" => self.texture_comp_instructions = v,
+            "tex_bias" => self.texture_bias_instructions = v,
+            "tex_gradient" => self.texture_gradient_instructions = v,
+            "movs" => self.mov_instruction_count = v,
+            "movcs" => self.movc_instruction_count = v,
+            "conversions" => self.conversion_instruction_count = v,
+            "gs_input_prim" => self.gs_input_primitive = v,
+            "gs_output_topo" => self.gs_output_topology = v,
+            "gs_max_verts" => self.gs_max_output_vertex_count = v,
+            "gs_instances" => self.gs_instance_count = v,
+            "hs_control_points" => self.hs_control_points = v,
+            "hs_output_prim" => self.hs_output_primitive = v,
+            "hs_partitioning" => self.hs_partitioning = v,
+            "ds_domain" => self.ds_tessellator_domain = v,
+            "barriers" => self.barrier_instructions = v,
+            "interlocked" => self.interlocked_instructions = v,
+            "tex_store" => self.texture_store_instructions = v,
+            _ => return false,
+        }
+        true
+    }
+}
+
+/// Serialize STAT to editable `key value` lines (plus `size` and `reserved`,
+/// needed to reproduce the exact byte length).
+pub fn stat_to_text(s: &ShaderStats) -> String {
+    let mut o = String::new();
+    let _ = writeln!(o, "size {}", s.raw_size);
+    let _ = writeln!(o, "sample_frequency {}", s.is_sample_frequency as u32);
+    let _ = writeln!(
+        o,
+        "reserved {} {} {} {}",
+        s.reserved[0], s.reserved[1], s.reserved[2], s.reserved[3]
+    );
+    for (k, v) in stat_fields(s) {
+        let _ = writeln!(o, "{k} {v}");
+    }
+    o
+}
+
+/// Parse the editable text form produced by [`stat_to_text`].
+pub fn stat_from_text(text: &str) -> Option<ShaderStats> {
+    let mut s = ShaderStats::default();
+    for line in text.lines() {
+        let line = line.trim();
+        if line.is_empty() {
+            continue;
+        }
+        let mut f = line.split_whitespace();
+        let key = f.next()?;
+        match key {
+            "size" => s.raw_size = f.next()?.parse().ok()?,
+            "sample_frequency" => s.is_sample_frequency = f.next()?.parse::<u32>().ok()? != 0,
+            "reserved" => {
+                for slot in &mut s.reserved {
+                    *slot = f.next()?.parse().ok()?;
+                }
+            }
+            other => {
+                let v = f.next()?.parse().ok()?;
+                if !s.set_field(other, v) {
+                    return None;
+                }
+            }
+        }
+    }
+    Some(s)
+}
 
 /// Shader statistics extracted from the STAT chunk.
 ///
@@ -85,6 +215,10 @@ pub struct ShaderStats {
     /// Number of texture store instructions.
     pub texture_store_instructions: u32,
 
+    /// Reserved/unknown dwords at payload offsets 88, 92, 108, 112 — preserved
+    /// verbatim for byte-exact round-trips.
+    pub reserved: [u32; 4],
+
     /// Original chunk size in bytes, used during round-trip writing so we
     /// emit exactly the same number of bytes as we read.
     pub raw_size: usize,
@@ -98,66 +232,53 @@ pub fn parse_stat(data: &[u8]) -> Option<ShaderStats> {
         return None;
     }
 
+    // Read every present dword; missing trailing fields default to 0.
     let mut c = SliceCursor::new(data);
-    let r = &mut c;
-
-    let mut s = ShaderStats {
-        instruction_count: r.read_u32_le().ok()?,
-        temp_register_count: r.read_u32_le().ok()?,
-        define_count: r.read_u32_le().ok()?,
-        declaration_count: r.read_u32_le().ok()?,
-        float_instruction_count: r.read_u32_le().ok()?,
-        int_instruction_count: r.read_u32_le().ok()?,
-        uint_instruction_count: r.read_u32_le().ok()?,
-        static_flow_control_count: r.read_u32_le().ok()?,
-        dynamic_flow_control_count: r.read_u32_le().ok()?,
-        macro_instruction_count: r.read_u32_le().ok()?,
-        temp_array_count: r.read_u32_le().ok()?,
-        array_instruction_count: r.read_u32_le().ok()?,
-        cut_instruction_count: r.read_u32_le().ok()?,
-        emit_instruction_count: r.read_u32_le().ok()?,
-        texture_normal_instructions: r.read_u32_le().ok()?,
-        texture_load_instructions: r.read_u32_le().ok()?,
-        texture_comp_instructions: r.read_u32_le().ok()?,
-        texture_bias_instructions: r.read_u32_le().ok()?,
-        texture_gradient_instructions: r.read_u32_le().ok()?,
-        mov_instruction_count: r.read_u32_le().ok()?,
-        movc_instruction_count: r.read_u32_le().ok()?,
-        conversion_instruction_count: r.read_u32_le().ok()?,
-        // Offsets 88 and 92 are unknown fields — skip 2 u32s
-        gs_input_primitive: {
-            r.seek(SeekFrom::Current(8)).ok()?;
-            r.read_u32_le().ok()?
-        },
-        gs_output_topology: r.read_u32_le().ok()?,
-        gs_max_output_vertex_count: r.read_u32_le().ok()?,
-        // Offsets 108 and 112 are unknown fields
-        is_sample_frequency: {
-            if data.len() >= 120 {
-                r.seek(SeekFrom::Start(116)).ok()?;
-                r.read_u32_le().ok()? != 0
-            } else {
-                false
-            }
-        },
-        raw_size: data.len(),
-        ..Default::default()
-    };
-
-    // SM5 extended fields start at offset 120
-    if data.len() >= 152 {
-        r.seek(SeekFrom::Start(120)).ok()?;
-        s.gs_instance_count = r.read_u32_le().ok()?;
-        s.hs_control_points = r.read_u32_le().ok()?;
-        s.hs_output_primitive = r.read_u32_le().ok()?;
-        s.hs_partitioning = r.read_u32_le().ok()?;
-        s.ds_tessellator_domain = r.read_u32_le().ok()?;
-        s.barrier_instructions = r.read_u32_le().ok()?;
-        s.interlocked_instructions = r.read_u32_le().ok()?;
-        s.texture_store_instructions = r.read_u32_le().ok()?;
+    let n = data.len() / 4;
+    let mut d = alloc::vec::Vec::with_capacity(n);
+    for _ in 0..n {
+        d.push(c.read_u32_le().ok()?);
     }
+    let g = |i: usize| d.get(i).copied().unwrap_or(0);
 
-    Some(s)
+    Some(ShaderStats {
+        instruction_count: g(0),
+        temp_register_count: g(1),
+        define_count: g(2),
+        declaration_count: g(3),
+        float_instruction_count: g(4),
+        int_instruction_count: g(5),
+        uint_instruction_count: g(6),
+        static_flow_control_count: g(7),
+        dynamic_flow_control_count: g(8),
+        macro_instruction_count: g(9),
+        temp_array_count: g(10),
+        array_instruction_count: g(11),
+        cut_instruction_count: g(12),
+        emit_instruction_count: g(13),
+        texture_normal_instructions: g(14),
+        texture_load_instructions: g(15),
+        texture_comp_instructions: g(16),
+        texture_bias_instructions: g(17),
+        texture_gradient_instructions: g(18),
+        mov_instruction_count: g(19),
+        movc_instruction_count: g(20),
+        conversion_instruction_count: g(21),
+        gs_input_primitive: g(24),
+        gs_output_topology: g(25),
+        gs_max_output_vertex_count: g(26),
+        is_sample_frequency: g(29) != 0,
+        gs_instance_count: g(30),
+        hs_control_points: g(31),
+        hs_output_primitive: g(32),
+        hs_partitioning: g(33),
+        ds_tessellator_domain: g(34),
+        barrier_instructions: g(35),
+        interlocked_instructions: g(36),
+        texture_store_instructions: g(37),
+        reserved: [g(22), g(23), g(27), g(28)],
+        raw_size: data.len(),
+    })
 }
 
 impl ChunkParser<'_> for ShaderStats {
@@ -172,57 +293,54 @@ impl ChunkWriter for ShaderStats {
     }
 
     fn write_payload(&self) -> alloc::vec::Vec<u8> {
-        let target_size = if self.raw_size > 0 {
-            self.raw_size
-        } else {
-            120
-        };
+        let target_size = if self.raw_size > 0 { self.raw_size } else { 120 };
+        // The full dword layout, in order. Only the first `target_size / 4`
+        // are emitted so short STAT chunks reproduce exactly.
+        let dwords = [
+            self.instruction_count,
+            self.temp_register_count,
+            self.define_count,
+            self.declaration_count,
+            self.float_instruction_count,
+            self.int_instruction_count,
+            self.uint_instruction_count,
+            self.static_flow_control_count,
+            self.dynamic_flow_control_count,
+            self.macro_instruction_count,
+            self.temp_array_count,
+            self.array_instruction_count,
+            self.cut_instruction_count,
+            self.emit_instruction_count,
+            self.texture_normal_instructions,
+            self.texture_load_instructions,
+            self.texture_comp_instructions,
+            self.texture_bias_instructions,
+            self.texture_gradient_instructions,
+            self.mov_instruction_count,
+            self.movc_instruction_count,
+            self.conversion_instruction_count,
+            self.reserved[0],
+            self.reserved[1],
+            self.gs_input_primitive,
+            self.gs_output_topology,
+            self.gs_max_output_vertex_count,
+            self.reserved[2],
+            self.reserved[3],
+            self.is_sample_frequency as u32,
+            self.gs_instance_count,
+            self.hs_control_points,
+            self.hs_output_primitive,
+            self.hs_partitioning,
+            self.ds_tessellator_domain,
+            self.barrier_instructions,
+            self.interlocked_instructions,
+            self.texture_store_instructions,
+        ];
+
         let mut buf = alloc::vec::Vec::with_capacity(target_size);
-        let w = |buf: &mut alloc::vec::Vec<u8>, v: u32| buf.extend_from_slice(&v.to_le_bytes());
-        w(&mut buf, self.instruction_count);
-        w(&mut buf, self.temp_register_count);
-        w(&mut buf, self.define_count);
-        w(&mut buf, self.declaration_count);
-        w(&mut buf, self.float_instruction_count);
-        w(&mut buf, self.int_instruction_count);
-        w(&mut buf, self.uint_instruction_count);
-        w(&mut buf, self.static_flow_control_count);
-        w(&mut buf, self.dynamic_flow_control_count);
-        w(&mut buf, self.macro_instruction_count);
-        w(&mut buf, self.temp_array_count);
-        w(&mut buf, self.array_instruction_count);
-        w(&mut buf, self.cut_instruction_count);
-        w(&mut buf, self.emit_instruction_count);
-        w(&mut buf, self.texture_normal_instructions);
-        w(&mut buf, self.texture_load_instructions);
-        w(&mut buf, self.texture_comp_instructions);
-        w(&mut buf, self.texture_bias_instructions);
-        w(&mut buf, self.texture_gradient_instructions);
-        w(&mut buf, self.mov_instruction_count);
-        w(&mut buf, self.movc_instruction_count);
-        w(&mut buf, self.conversion_instruction_count);
-        w(&mut buf, 0); // unknown at offset 88
-        w(&mut buf, 0); // unknown at offset 92
-        w(&mut buf, self.gs_input_primitive);
-        w(&mut buf, self.gs_output_topology);
-        w(&mut buf, self.gs_max_output_vertex_count);
-        w(&mut buf, 0); // unknown at offset 108
-        w(&mut buf, 0); // unknown at offset 112
-        w(&mut buf, self.is_sample_frequency as u32);
-
-        // SM5 extended fields (offset 120+)
-        if target_size >= 152 {
-            w(&mut buf, self.gs_instance_count);
-            w(&mut buf, self.hs_control_points);
-            w(&mut buf, self.hs_output_primitive);
-            w(&mut buf, self.hs_partitioning);
-            w(&mut buf, self.ds_tessellator_domain);
-            w(&mut buf, self.barrier_instructions);
-            w(&mut buf, self.interlocked_instructions);
-            w(&mut buf, self.texture_store_instructions);
+        for &v in dwords.iter().take(target_size / 4) {
+            buf.extend_from_slice(&v.to_le_bytes());
         }
-
-        // Pad to original size if there were additional trailing bytes
         buf.resize(target_size, 0);
         buf
     }
