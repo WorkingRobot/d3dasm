@@ -82,6 +82,10 @@ fn encode_to_text(fourcc: [u8; 4], data: &[u8]) -> Option<String> {
         let stats = dxbc::chunks::stat::parse_stat(data)?;
         return Some(dxbc::chunks::stat::stat_to_text(&stats));
     }
+    if &fourcc == b"RDEF" {
+        let rd = dxbc::chunks::rdef::parse_rdef(data)?;
+        return dxbc::chunks::rdef::rdef_to_text(&rd);
+    }
     None
 }
 
@@ -101,6 +105,12 @@ fn body_to_chunk(fourcc: [u8; 4], body: &str) -> Result<Vec<u8>, AsmError> {
         let stats =
             dxbc::chunks::stat::stat_from_text(body).ok_or_else(|| err("malformed stat text"))?;
         return Ok(stats.to_writable().data);
+    }
+    if &fourcc == b"RDEF" {
+        use dxbc::chunks::ChunkWriter;
+        let rd =
+            dxbc::chunks::rdef::rdef_from_text(body).ok_or_else(|| err("malformed rdef text"))?;
+        return Ok(rd.to_writable().data);
     }
     Err(err("no text codec for chunk"))
 }
