@@ -174,6 +174,8 @@ pub(crate) fn opcode_imm_type(op: Opcode) -> ImmediateType {
         // Signed atomics
         | Opcode::AtomicIAdd | Opcode::AtomicIMax | Opcode::AtomicIMin
         | Opcode::ImmAtomicIAdd | Opcode::ImmAtomicIMax | Opcode::ImmAtomicIMin
+        // Raw/structured buffer loads: the immediate is a byte offset (integer)
+        | Opcode::LdRaw | Opcode::LdStructured
         => ImmediateType::Int,
 
         // Unsigned / bitwise — render as hex
@@ -195,8 +197,8 @@ pub(crate) fn opcode_imm_type(op: Opcode) -> ImmediateType {
         // mov/movc/swapc copy bits — use float as default since most shaders are float-heavy
         | Opcode::Mov | Opcode::Movc | Opcode::Swapc
         // load/store — typically uint addressing, but payload may be float
-        | Opcode::Ld | Opcode::LdMs | Opcode::LdUavTyped | Opcode::LdRaw
-        | Opcode::LdStructured | Opcode::StoreUavTyped | Opcode::StoreRaw
+        | Opcode::Ld | Opcode::LdMs | Opcode::LdUavTyped
+        | Opcode::StoreUavTyped | Opcode::StoreRaw
         | Opcode::StoreStructured | Opcode::Resinfo | Opcode::BufInfo
         => ImmediateType::Float,
 

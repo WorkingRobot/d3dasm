@@ -159,8 +159,34 @@ fn opcode_from_mnemonic(mnemonic: &str) -> Result<(Opcode, &str), AsmError> {
     }
 }
 
+/// Split an opcode's modifier tail on `_`, but only at paren depth 0 so a
+/// parenthesized argument may itself contain `_` (e.g. `res(structured_buffer,
+/// stride=32)`).
+fn split_modifiers(s: &str) -> alloc::vec::Vec<&str> {
+    let mut segs = alloc::vec::Vec::new();
+    let mut depth = 0i32;
+    let mut start = 0;
+    for (i, b) in s.bytes().enumerate() {
+        match b {
+            b'(' => depth += 1,
+            b')' => depth -= 1,
+            b'_' if depth == 0 => {
+                if i > start {
+                    segs.push(&s[start..i]);
+                }
+                start = i + 1;
+            }
+            _ => {}
+        }
+    }
+    if start < s.len() {
+        segs.push(&s[start..]);
+    }
+    segs
+}
+
 fn apply_modifiers(instr: &mut Instruction, modifiers: &str) -> Result<(), AsmError> {
-    for seg in modifiers.split('_').filter(|s| !s.is_empty()) {
+    for seg in split_modifiers(modifiers) {
         if seg == "sat" {
             instr.saturate = true;
         } else if seg == "nz" {

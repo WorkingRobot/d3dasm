@@ -103,6 +103,8 @@ pub(crate) const DIMENSIONS: &[(&str, u32)] = &[
     ("texture2darray", 8),
     ("texture2dmsarray", 9),
     ("texturecubearray", 10),
+    ("raw_buffer", 11),
+    ("structured_buffer", 12),
 ];
 
 /// Sampler modes (token0 bits 11-14).
