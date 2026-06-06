@@ -680,17 +680,38 @@ fn place_type<'a>(
             return *off;
         }
     }
+    // Type name first (struct/object types reference an interned name string).
     let name_off = if td.name.is_empty() {
         0
     } else {
         intern(out, pool, &td.name)
+    };
+    // For struct types: lay out member names + member type descriptors, then
+    // the member-descriptor array, before the struct descriptor itself.
+    let member_off = if td.members.is_empty() {
+        0u32
+    } else {
+        let mut child_offsets = Vec::with_capacity(td.members.len());
+        for m in &td.members {
+            intern(out, pool, &m.name);
+            child_offsets.push(place_type(out, pool, placed, &m.member_type, is_sm5));
+        }
+        pad4(out);
+        let moff = out.len() as u32;
+        for (i, m) in td.members.iter().enumerate() {
+            let mn = intern(out, pool, &m.name);
+            push_u32(out, mn);
+            push_u32(out, child_offsets[i]);
+            push_u32(out, m.offset);
+        }
+        moff
     };
     pad4(out);
     let off = out.len() as u32;
     push_u32(out, (td.class as u32) | ((td.var_type as u32) << 16));
     push_u32(out, (td.rows as u32) | ((td.columns as u32) << 16));
     push_u32(out, (td.elements as u32) | ((td.members.len() as u32) << 16));
-    push_u32(out, 0); // member descriptor offset (members not laid out)
+    push_u32(out, member_off);
     if is_sm5 {
         match &td.sm5_extra {
             Some(e) => {
