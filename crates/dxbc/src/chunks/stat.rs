@@ -293,7 +293,11 @@ impl ChunkWriter for ShaderStats {
     }
 
     fn write_payload(&self) -> alloc::vec::Vec<u8> {
-        let target_size = if self.raw_size > 0 { self.raw_size } else { 120 };
+        let target_size = if self.raw_size > 0 {
+            self.raw_size
+        } else {
+            120
+        };
         // The full dword layout, in order. Only the first `target_size / 4`
         // are emitted so short STAT chunks reproduce exactly.
         let dwords = [

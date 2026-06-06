@@ -125,8 +125,8 @@ fn is_sm5(target_version: u32) -> bool {
 
 fn base_size(var_type: u16) -> u32 {
     match var_type {
-        39 => 8,  // double
-        _ => 4,   // bool/int/uint/float
+        39 => 8, // double
+        _ => 4,  // bool/int/uint/float
     }
 }
 
@@ -645,24 +645,45 @@ fn emit_merged_body(
     sm5: bool,
     reads: Option<&BTreeMap<u32, CbReads>>,
 ) -> Option<String> {
-    // Only merge when every cbuffer def is a plain register cbuffer (kind 0);
-    // resource defs (structured buffers etc.) keep the two-section form so no
-    // def has to be reconstructed from a binding.
-    if rd.constant_buffers.iter().any(|c| c.cb_type != 0) {
-        return None;
-    }
-    // The cbuffer bindings, in binding order, must match the cbuffer-def order.
-    let bnames: Vec<&str> = rd
+    // Reconstruction places kind-0 defs (in cbuffer-binding order) first, then
+    // resource defs (in structured-binding order); mergeable only when that
+    // reproduces the actual cbuffer-def order. Regular cbuffers become
+    // `cbuffer N : register(bN) {..}` blocks; resource defs are rebuilt from
+    // their `StructuredBuffer<T>` declarations on parse (no kind=3 block).
+    let mut expected: Vec<&str> = rd
         .bindings
         .iter()
         .filter(|b| b.input_type == 0)
         .map(|b| b.name.as_ref())
         .collect();
-    let dnames: Vec<&str> = rd.constant_buffers.iter().map(|c| c.name.as_ref()).collect();
-    if bnames != dnames || bnames.len() != rd.constant_buffers.len() {
+    expected.extend(
+        rd.bindings
+            .iter()
+            .filter(|b| matches!(b.input_type, 5 | 6 | 9 | 10 | 11))
+            .map(|b| b.name.as_ref()),
+    );
+    let dnames: Vec<&str> = rd
+        .constant_buffers
+        .iter()
+        .map(|c| c.name.as_ref())
+        .collect();
+    // The reconstructed order must contain exactly the cbuffer-def names.
+    let mut es = expected.clone();
+    es.sort_unstable();
+    let mut ds = dnames.clone();
+    ds.sort_unstable();
+    if es != ds {
         return None;
     }
     let mut o = String::new();
+    // When fxc's def order differs from the reconstructed order, record it.
+    if expected != dnames {
+        o.push_str("cborder");
+        for n in &dnames {
+            let _ = write!(o, " {n}");
+        }
+        o.push('\n');
+    }
     for b in &rd.bindings {
         if b.input_type == 0 {
             let cb = rd.constant_buffers.iter().find(|c| c.name == b.name)?;
@@ -768,10 +789,7 @@ fn parse_binding(line: &str) -> Option<ResourceBinding<'static>> {
     // After the name, find `register(...)`.
     let rest: Vec<&str> = it.collect();
     let reg_tok = rest.iter().find(|t| t.starts_with("register("))?;
-    let inner = reg_tok
-        .strip_prefix("register(")?
-        .split(')')
-        .next()?;
+    let inner = reg_tok.strip_prefix("register(")?.split(')').next()?;
     let regclass = inner.chars().next()?;
     // slot then optional `[count]` (count may be appended to the register token).
     let after = &reg_tok[reg_tok.find(')')? + 1..];
@@ -939,6 +957,21 @@ pub fn rdef_from_hlsl(text: &str, program: Option<&Program>) -> Option<ResourceD
     }
     let mut block: Option<Block> = None;
     let mut sm5 = false;
+    // Resource (kind != 0) defs reconstructed in merged mode, appended after all
+    // regular cbuffer defs to reproduce fxc's def-array order.
+    let mut resource_defs: Vec<CBufferDef<'static>> = Vec::new();
+    // Explicit cbuffer-def order (merged mode, when it differs from the natural
+    // reconstructed order).
+    let mut cb_order: Option<Vec<String>> = None;
+
+    // Merged mode: every cbuffer layout block carries a register, so resource
+    // (structured-buffer) defs aren't written out and must be reconstructed
+    // from their `StructuredBuffer<T>` declarations. (Two-section mode has
+    // register-less `cbuffer N {..}` blocks for them instead.)
+    let merged_mode = !text.lines().any(|l| {
+        let l = l.trim();
+        l.starts_with("cbuffer ") && l.ends_with('{') && !l.contains(": register(")
+    });
 
     for raw in text.lines() {
         let line = raw.trim();
@@ -1072,6 +1105,9 @@ pub fn rdef_from_hlsl(text: &str, program: Option<&Program>) -> Option<ResourceD
                 sm5 = is_sm5(rd.target_version);
             }
             "flags" => rd.compile_flags = u32::from_str_radix(rest.trim(), 16).ok()?,
+            "cborder" => {
+                cb_order = Some(rest.split_whitespace().map(String::from).collect());
+            }
             "creator" => rd.creator = Cow::Owned(String::from(rest)),
             "rd11" => {
                 let mut a = [0u32; 8];
@@ -1123,10 +1159,10 @@ pub fn rdef_from_hlsl(text: &str, program: Option<&Program>) -> Option<ResourceD
                     let name = it.next()?;
                     let toks: Vec<&str> = it.collect();
                     let m = kv(toks.iter().copied());
-                    if let Some(reg) = toks
-                        .iter()
-                        .find_map(|t| t.strip_prefix("register(").and_then(|s| s.strip_suffix(')')))
-                    {
+                    if let Some(reg) = toks.iter().find_map(|t| {
+                        t.strip_prefix("register(")
+                            .and_then(|s| s.strip_suffix(')'))
+                    }) {
                         // Merged: emit both the binding and the layout def.
                         let slot: u32 = reg.get(1..)?.parse().ok()?;
                         rd.bindings.push(ResourceBinding {
@@ -1162,8 +1198,54 @@ pub fn rdef_from_hlsl(text: &str, program: Option<&Program>) -> Option<ResourceD
                 }
             }
             // Any other head is a resource-binding declaration.
-            _ => rd.bindings.push(parse_binding(line)?),
+            _ => {
+                rd.bindings.push(parse_binding(line)?);
+                // In merged mode, a structured-buffer binding implies a resource
+                // def; reconstruct it from the declared element type `<T>`.
+                let (input_type, bname) = {
+                    let b = rd.bindings.last()?;
+                    (b.input_type, b.name.clone())
+                };
+                if merged_mode && matches!(input_type, 5 | 6 | 9 | 10 | 11) {
+                    let spec = line.split_whitespace().next()?;
+                    let elem = spec
+                        .split_once('<')
+                        .and_then(|(_, r)| r.strip_suffix('>'))?;
+                    let et = resolve_type(elem, false, &structs, sm5)?;
+                    let size = type_size(&et);
+                    resource_defs.push(CBufferDef {
+                        name: bname,
+                        variables: alloc::vec![CBufferVariable {
+                            name: Cow::Owned(String::from("$Element")),
+                            offset: 0,
+                            size,
+                            flags: BIND_FLAG_USED,
+                            var_type: et,
+                            default_value: Cow::Owned(Vec::new()),
+                            texture_start: if sm5 { Some(SLOT_UNUSED) } else { None },
+                            texture_size: if sm5 { Some(0) } else { None },
+                            sampler_start: if sm5 { Some(SLOT_UNUSED) } else { None },
+                            sampler_size: if sm5 { Some(0) } else { None },
+                        }],
+                        size,
+                        flags: 0,
+                        cb_type: 3,
+                    });
+                }
+            }
         }
+    }
+
+    // Reconstructed resource defs follow all regular cbuffer defs.
+    rd.constant_buffers.append(&mut resource_defs);
+    // Apply an explicit def order when fxc's differed from the natural one.
+    if let Some(order) = &cb_order {
+        rd.constant_buffers.sort_by_key(|cb| {
+            order
+                .iter()
+                .position(|n| n.as_str() == cb.name.as_ref())
+                .unwrap_or(usize::MAX)
+        });
     }
 
     // Constant-buffer `size` is the byte span of its variables. Regular

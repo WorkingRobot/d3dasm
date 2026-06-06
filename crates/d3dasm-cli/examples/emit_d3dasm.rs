@@ -11,7 +11,9 @@ use std::path::Path;
 
 fn main() {
     let mut args = std::env::args().skip(1);
-    let out_dir = args.next().expect("usage: emit_d3dasm <out_dir> <files...>");
+    let out_dir = args
+        .next()
+        .expect("usage: emit_d3dasm <out_dir> <files...>");
     std::fs::create_dir_all(&out_dir).expect("create out dir");
 
     let mut emitted = 0usize;

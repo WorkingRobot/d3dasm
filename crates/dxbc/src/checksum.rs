@@ -59,10 +59,7 @@ fn transform(state: &mut [u32; 4], block: &[u8; 64]) {
         } else {
             (c ^ (b | !d), (7 * i) % 16)
         };
-        let f = f
-            .wrapping_add(a)
-            .wrapping_add(K[i])
-            .wrapping_add(m[g]);
+        let f = f.wrapping_add(a).wrapping_add(K[i]).wrapping_add(m[g]);
         a = d;
         d = c;
         c = b;

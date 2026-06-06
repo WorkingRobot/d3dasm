@@ -650,7 +650,11 @@ fn pad4(out: &mut Vec<u8>) {
 
 /// Intern a null-terminated string into a single content-deduped pool,
 /// appending it at the current end of `out` on first use.
-fn intern(out: &mut Vec<u8>, pool: &mut alloc::collections::BTreeMap<alloc::string::String, u32>, s: &str) -> u32 {
+fn intern(
+    out: &mut Vec<u8>,
+    pool: &mut alloc::collections::BTreeMap<alloc::string::String, u32>,
+    s: &str,
+) -> u32 {
     if let Some(&off) = pool.get(s) {
         return off;
     }
@@ -700,8 +704,8 @@ pub fn hlsl_type_name(td: &TypeDesc<'_>) -> Option<alloc::string::String> {
     }
     let base = base_type_name(td.var_type)?;
     let core = match td.class {
-        0 => String::from(base),                              // scalar
-        1 => alloc::format!("{base}{}", td.columns),          // vector
+        0 => String::from(base),                                     // scalar
+        1 => alloc::format!("{base}{}", td.columns),                 // vector
         2 | 3 => alloc::format!("{base}{}x{}", td.rows, td.columns), // matrix
         _ => return None,
     };
@@ -722,7 +726,9 @@ pub fn parse_hlsl_type(s: &str) -> Option<(u16, u16, u16, u16, u16)> {
         None => (s, 0u16),
     };
     // Split leading alphabetic base from the trailing dimension digits.
-    let split = core.find(|c: char| c.is_ascii_digit()).unwrap_or(core.len());
+    let split = core
+        .find(|c: char| c.is_ascii_digit())
+        .unwrap_or(core.len());
     let base = base_type_from(&core[..split])?;
     let dims = &core[split..];
     let (class, rows, cols) = if dims.is_empty() {
@@ -797,7 +803,10 @@ fn place_type<'a>(
     let off = out.len() as u32;
     push_u32(out, (td.class as u32) | ((td.var_type as u32) << 16));
     push_u32(out, (td.rows as u32) | ((td.columns as u32) << 16));
-    push_u32(out, (td.elements as u32) | ((td.members.len() as u32) << 16));
+    push_u32(
+        out,
+        (td.elements as u32) | ((td.members.len() as u32) << 16),
+    );
     push_u32(out, member_off);
     if is_sm5 {
         match &td.sm5_extra {
@@ -879,7 +888,11 @@ impl ChunkWriter for ResourceDef<'_> {
         patch_u32(
             &mut out,
             cb_off_pos,
-            if self.constant_buffers.is_empty() { 0 } else { cb_section },
+            if self.constant_buffers.is_empty() {
+                0
+            } else {
+                cb_section
+            },
         );
         let mut cb_name_pos = Vec::with_capacity(self.constant_buffers.len());
         let mut cb_var_pos = Vec::with_capacity(self.constant_buffers.len());
@@ -1016,8 +1029,14 @@ pub fn rdef_to_text(rd: &ResourceDef<'_>) -> Option<alloc::string::String> {
         let _ = writeln!(
             o,
             "binding {} input={} return={} dim={} samples={} slot={} count={} flags={:x}",
-            b.name, b.input_type, b.return_type, b.dimension, b.num_samples, b.bind_point,
-            b.bind_count, b.flags
+            b.name,
+            b.input_type,
+            b.return_type,
+            b.dimension,
+            b.num_samples,
+            b.bind_point,
+            b.bind_count,
+            b.flags
         );
     }
     for cb in &rd.constant_buffers {
@@ -1178,11 +1197,7 @@ pub fn rdef_from_text(text: &str) -> Option<ResourceDef<'static>> {
                 let m = kv(f);
                 let member_type = parse_type(&m)?;
                 let offset = dec(&m, "offset")?;
-                let var = rd
-                    .constant_buffers
-                    .last_mut()?
-                    .variables
-                    .last_mut()?;
+                let var = rd.constant_buffers.last_mut()?.variables.last_mut()?;
                 var.var_type.members.push(MemberDesc {
                     name: Cow::Owned(String::from(name)),
                     member_type,

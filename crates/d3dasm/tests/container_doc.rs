@@ -68,7 +68,10 @@ fn container_document_roundtrip() {
     // Forensic header + directives are present.
     assert!(text.contains("// Container:"), "missing header:\n{text}");
     assert!(text.contains("PRIV"), "missing chunk inventory:\n{text}");
-    assert!(text.contains(".code SHEX"), "missing program chunk:\n{text}");
+    assert!(
+        text.contains(".code SHEX"),
+        "missing program chunk:\n{text}"
+    );
     assert!(text.contains("\nret"), "missing disassembly body:\n{text}");
     assert!(text.contains(".chunk PRIV"), "missing raw chunk:\n{text}");
 

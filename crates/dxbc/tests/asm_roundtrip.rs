@@ -320,7 +320,10 @@ fn declarations_have_no_garbage_modifiers() {
         !canon.instructions[0].saturate,
         "decode leaked garbage saturate"
     );
-    assert_eq!(canon.instructions[0].precise_mask, 0, "garbage precise_mask");
+    assert_eq!(
+        canon.instructions[0].precise_mask, 0,
+        "garbage precise_mask"
+    );
     rt(&prog);
 }
 
@@ -370,7 +373,11 @@ fn resource_extended_tokens() {
         vec![
             temp(0, MASK_ALL),
             temp(1, XYZW),
-            reg_op(RegisterType::Resource, XYZW, smallvec![OperandIndex::Imm32(0)]),
+            reg_op(
+                RegisterType::Resource,
+                XYZW,
+                smallvec![OperandIndex::Imm32(0)],
+            ),
             reg_op(
                 RegisterType::Sampler,
                 ComponentSelect::ZeroComponent,
@@ -381,7 +388,11 @@ fn resource_extended_tokens() {
     // type 2, dim=texture2d(3), stride=0 ; type 3, four floats(5)
     i.resource_dim = Some(2 | (3 << 6));
     i.resource_return_type = Some(3 | (5 << 6) | (5 << 10) | (5 << 14) | (5 << 18));
-    let canon = decode(&encode(&program(vec![i.clone(), generic(Opcode::Ret, vec![])]))).unwrap();
+    let canon = decode(&encode(&program(vec![
+        i.clone(),
+        generic(Opcode::Ret, vec![]),
+    ])))
+    .unwrap();
     let text = serialize(&canon);
     assert!(
         text.contains("_res(texture2d)"),

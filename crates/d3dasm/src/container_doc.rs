@@ -71,7 +71,9 @@ pub fn serialize(shader: &Shader) -> String {
 // when `chunk_to_body` confirms its text round-trips to the exact bytes.
 // ---------------------------------------------------------------------------
 
-const SIGNATURE_FOURCCS: &[&[u8; 4]] = &[b"ISGN", b"ISG1", b"OSGN", b"OSG1", b"OSG5", b"PCSG", b"PSG1"];
+const SIGNATURE_FOURCCS: &[&[u8; 4]] = &[
+    b"ISGN", b"ISG1", b"OSGN", b"OSG1", b"OSG5", b"PCSG", b"PSG1",
+];
 
 /// Editable text for a chunk, if a codec exists for its FourCC. `program` is
 /// the container's decoded shader program, used to derive RDEF `used` flags.
@@ -201,7 +203,9 @@ pub fn assemble(text: &str) -> Result<Vec<u8>, AsmError> {
         .collect();
 
     let mut idx = 0;
-    let header = lines.first().ok_or_else(|| err("empty container document"))?;
+    let header = lines
+        .first()
+        .ok_or_else(|| err("empty container document"))?;
     let version = parse_dxbc_directive(header)?;
     idx += 1;
 
@@ -405,5 +409,7 @@ fn hex_nibble(b: u8) -> Result<u8, AsmError> {
 }
 
 fn err(msg: impl Into<String>) -> AsmError {
-    AsmError { message: msg.into() }
+    AsmError {
+        message: msg.into(),
+    }
 }

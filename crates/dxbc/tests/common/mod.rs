@@ -50,7 +50,11 @@ pub fn generic(opcode: Opcode, operands: Vec<Operand>) -> Instruction {
 }
 
 pub fn temp(reg: u32, comp: ComponentSelect) -> Operand {
-    reg_op(RegisterType::Temp, comp, smallvec![OperandIndex::Imm32(reg)])
+    reg_op(
+        RegisterType::Temp,
+        comp,
+        smallvec![OperandIndex::Imm32(reg)],
+    )
 }
 
 pub fn reg_op(reg_type: RegisterType, components: ComponentSelect, indices: Indices) -> Operand {
@@ -73,7 +77,10 @@ pub fn rt(p: &Program) {
     let text = serialize(&canon);
     let parsed =
         assemble(&text).unwrap_or_else(|e| panic!("parse error: {e}\n--- text ---\n{text}"));
-    assert_eq!(canon, parsed, "IR round-trip mismatch\n--- text ---\n{text}");
+    assert_eq!(
+        canon, parsed,
+        "IR round-trip mismatch\n--- text ---\n{text}"
+    );
     assert_eq!(
         encode(&canon),
         encode(&parsed),
