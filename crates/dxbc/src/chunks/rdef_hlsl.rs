@@ -177,6 +177,129 @@ fn derived_var_size(td: &TypeDesc<'_>) -> Option<u32> {
     })
 }
 
+/// Number of scalar components in a non-array scalar/vector/matrix type.
+fn component_count(t: &TypeDesc<'_>) -> Option<usize> {
+    if t.elements != 0 || !t.members.is_empty() {
+        return None;
+    }
+    Some(match t.class {
+        0 => 1,
+        1 => t.columns as usize,
+        2 | 3 => t.rows as usize * t.columns as usize,
+        _ => return None,
+    })
+}
+
+/// One scalar component's value → HLSL literal (None if it can't round-trip).
+fn scalar_value_str(var_type: u16, w: u32) -> Option<String> {
+    Some(match var_type {
+        3 => {
+            let f = f32::from_bits(w);
+            let s = alloc::format!("{f}");
+            if s.parse::<f32>().ok()?.to_bits() != w {
+                return None;
+            }
+            s
+        }
+        2 => alloc::format!("{}", w as i32),
+        19 => alloc::format!("{w}"),
+        1 if w == 0 => String::from("false"),
+        _ => return None,
+    })
+}
+
+fn scalar_value_parse(var_type: u16, p: &str) -> Option<u32> {
+    Some(match var_type {
+        3 => p.parse::<f32>().ok()?.to_bits(),
+        2 => p.parse::<i32>().ok()? as u32,
+        19 => p.parse::<u32>().ok()?,
+        1 if p == "false" => 0,
+        1 if p == "true" => 1,
+        _ => return None,
+    })
+}
+
+fn read_u32(bytes: &[u8], off: usize) -> Option<u32> {
+    Some(u32::from_le_bytes([
+        *bytes.get(off)?,
+        *bytes.get(off + 1)?,
+        *bytes.get(off + 2)?,
+        *bytes.get(off + 3)?,
+    ]))
+}
+
+/// Render a default value as an HLSL initializer (`1.5`, `float4(1,2,3,4)`,
+/// `false`, `{0,1,2}`). Returns `None` for types/values that can't round-trip
+/// exactly, so the caller keeps the raw hex form. (No spaces — initializers must
+/// stay a single whitespace token.)
+fn render_default(t: &TypeDesc<'_>, bytes: &[u8]) -> Option<String> {
+    if !t.members.is_empty() {
+        return None;
+    }
+    if t.elements == 0 {
+        let comps = component_count(t)?;
+        let vals: Option<Vec<String>> = (0..comps)
+            .map(|i| scalar_value_str(t.var_type, read_u32(bytes, i * 4)?))
+            .collect();
+        let vals = vals?;
+        if comps == 1 {
+            return Some(vals.into_iter().next().unwrap());
+        }
+        return Some(alloc::format!("{}({})", hlsl_type_name(t)?, vals.join(",")));
+    }
+    // Array. Only scalar-element arrays (the corpus only has `int[N]`); each
+    // element is padded to a 16-byte register, so padding must be zero.
+    if t.class != 0 {
+        return None;
+    }
+    let n = t.elements as usize;
+    if bytes.len() != (n - 1) * 16 + 4 {
+        return None;
+    }
+    let mut parts = Vec::with_capacity(n);
+    for (e, chunk) in bytes.chunks(16).enumerate() {
+        // Trailing bytes of each element (beyond the scalar) must be padding.
+        if e + 1 < n && chunk.get(4..).is_some_and(|p| p.iter().any(|&b| b != 0)) {
+            return None;
+        }
+        parts.push(scalar_value_str(t.var_type, read_u32(chunk, 0)?)?);
+    }
+    Some(alloc::format!("{{{}}}", parts.join(",")))
+}
+
+/// Parse an HLSL default initializer back into the raw little-endian bytes.
+fn parse_default(t: &TypeDesc<'_>, s: &str) -> Option<Vec<u8>> {
+    if t.elements != 0 {
+        // `{v0,v1,...}` scalar array.
+        let inner = s.strip_prefix('{')?.strip_suffix('}')?;
+        let parts: Vec<&str> = inner.split(',').collect();
+        let n = t.elements as usize;
+        if parts.len() != n {
+            return None;
+        }
+        let mut out = alloc::vec![0u8; (n - 1) * 16 + 4];
+        for (e, p) in parts.iter().enumerate() {
+            let w = scalar_value_parse(t.var_type, p.trim())?;
+            out[e * 16..e * 16 + 4].copy_from_slice(&w.to_le_bytes());
+        }
+        return Some(out);
+    }
+    let comps = component_count(t)?;
+    let parts: Vec<&str> = if comps == 1 {
+        alloc::vec![s]
+    } else {
+        s.split_once('(')?.1.strip_suffix(')')?.split(',').collect()
+    };
+    if parts.len() != comps {
+        return None;
+    }
+    let mut out = Vec::with_capacity(comps * 4);
+    for p in parts {
+        out.extend_from_slice(&scalar_value_parse(t.var_type, p.trim())?.to_le_bytes());
+    }
+    Some(out)
+}
+
 /// Byte offset → `packoffset(cR[.comp])` (None if not 4-byte aligned).
 fn packoffset_str(offset: u32) -> Option<String> {
     if offset % 4 != 0 {
@@ -516,9 +639,13 @@ fn emit_var(
         let _ = write!(o, " samp={},{}", ss as i32, v.sampler_size.unwrap_or(0));
     }
     if !v.default_value.is_empty() {
-        o.push_str(" default=");
-        for byte in v.default_value.iter() {
-            let _ = write!(o, "{byte:02x}");
+        if let Some(init) = render_default(t, &v.default_value) {
+            let _ = write!(o, " = {init}");
+        } else {
+            o.push_str(" default=");
+            for byte in v.default_value.iter() {
+                let _ = write!(o, "{byte:02x}");
+            }
         }
     }
     // Track whether this is an SM5 var (tex/samp Options present) for parse.
@@ -930,21 +1057,29 @@ struct VarTail {
     tex: Option<(u32, u32)>,
     samp: Option<(u32, u32)>,
     default: Vec<u8>,
+    /// HLSL initializer literal after `=`, resolved against the type later.
+    default_init: Option<String>,
 }
 
 fn parse_var_tail<'a>(toks: impl Iterator<Item = &'a str> + Clone) -> Option<VarTail> {
-    let m = kv(toks.clone());
+    let toks: Vec<&str> = toks.collect();
+    let m = kv(toks.iter().copied());
     let mut flags: Option<u32> = None;
-    for t in toks {
-        if t == "used" {
+    for t in &toks {
+        if *t == "used" {
             flags = Some(BIND_FLAG_USED);
-        } else if t == "unused" {
+        } else if *t == "unused" {
             flags = Some(0);
         }
     }
     if let Some(v) = m.get("vflags") {
         flags = Some(u32::from_str_radix(v, 16).ok()?);
     }
+    let default_init = toks
+        .iter()
+        .position(|t| *t == "=")
+        .and_then(|i| toks.get(i + 1))
+        .map(|s| String::from(*s));
     let pair = |s: &str| -> Option<(u32, u32)> {
         let (a, b) = s.split_once(',')?;
         Some((a.parse::<i32>().ok()? as u32, b.parse().ok()?))
@@ -971,6 +1106,7 @@ fn parse_var_tail<'a>(toks: impl Iterator<Item = &'a str> + Clone) -> Option<Var
             Some(h) => hex_bytes(h)?,
             None => Vec::new(),
         },
+        default_init,
     })
 }
 
@@ -1115,6 +1251,10 @@ pub fn rdef_from_hlsl(text: &str, program: Option<&Program>) -> Option<ResourceD
                         Some(s) => s,
                         None => derived_var_size(&vt)?,
                     };
+                    let default = match &tail.default_init {
+                        Some(init) => parse_default(&vt, init)?,
+                        None => tail.default,
+                    };
                     let cb = rd.constant_buffers.last_mut()?;
                     cb.variables.push(CBufferVariable {
                         name: Cow::Owned(String::from(vname)),
@@ -1122,7 +1262,7 @@ pub fn rdef_from_hlsl(text: &str, program: Option<&Program>) -> Option<ResourceD
                         size,
                         flags: tail.flags.unwrap_or(DERIVE_USED),
                         var_type: vt,
-                        default_value: Cow::Owned(tail.default),
+                        default_value: Cow::Owned(default),
                         texture_start: tail.tex.map(|t| t.0).or(if sm5 {
                             Some(SLOT_UNUSED)
                         } else {
