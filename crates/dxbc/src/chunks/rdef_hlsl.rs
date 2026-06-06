@@ -149,12 +149,32 @@ fn natural_size(td: &TypeDesc<'_>) -> Option<u32> {
     if td.elements != 0 || !td.members.is_empty() {
         return None;
     }
+    element_size(td)
+}
+
+/// Byte size of one element (ignoring any array dimension).
+fn element_size(td: &TypeDesc<'_>) -> Option<u32> {
+    if !td.members.is_empty() {
+        return None;
+    }
     let b = base_size(td.var_type);
     Some(match td.class {
         0 => b,
         1 => b * td.columns as u32,
         2 | 3 => b * td.rows as u32 * td.columns as u32,
         _ => return None,
+    })
+}
+
+/// Total byte size of a cbuffer variable, applying HLSL array packing: each
+/// element is padded to a 16-byte register, except the last keeps its size, so
+/// `size = (n-1)·round16(elem) + elem`. Matches the stored size exactly.
+fn derived_var_size(td: &TypeDesc<'_>) -> Option<u32> {
+    let elem = element_size(td)?;
+    Some(if td.elements == 0 {
+        elem
+    } else {
+        (td.elements as u32 - 1) * elem.div_ceil(16) * 16 + elem
     })
 }
 
@@ -436,8 +456,8 @@ fn emit_var(
     }
     let po = packoffset_str(v.offset)?;
     let _ = write!(o, " : packoffset({po})");
-    // size: omit when it matches the natural size of a non-array type.
-    if natural_size(t) != Some(v.size) {
+    // size: derived from the type (with array packing), so tag only on mismatch.
+    if derived_var_size(t) != Some(v.size) {
         let _ = write!(o, " size={}", v.size);
     }
     // The `used` flag is derived from the program when available; tag the
@@ -1069,7 +1089,7 @@ pub fn rdef_from_hlsl(text: &str, program: Option<&Program>) -> Option<ResourceD
                     }
                     let size = match tail.size {
                         Some(s) => s,
-                        None => natural_size(&vt)?,
+                        None => derived_var_size(&vt)?,
                     };
                     let cb = rd.constant_buffers.last_mut()?;
                     cb.variables.push(CBufferVariable {
