@@ -11,7 +11,7 @@
 //! explicit `key=value` form in [`super::rdef`].
 
 use alloc::borrow::Cow;
-use alloc::collections::BTreeMap;
+use alloc::collections::{BTreeMap, BTreeSet};
 use alloc::string::String;
 use alloc::vec::Vec;
 use core::fmt::Write as _;
@@ -22,6 +22,98 @@ use super::rdef::{
     BIND_FLAG_USER_PACKED, CBufferDef, CBufferVariable, MemberDesc, ResourceBinding, ResourceDef,
     SLOT_UNUSED, TypeDesc, hlsl_type_name, parse_hlsl_type,
 };
+use crate::shex::{ComponentSelect, Operand, OperandIndex, Program, RegisterType};
+
+// ---------------------------------------------------------------------------
+// Constant-buffer usage analysis (derives the `used` flag from the program)
+// ---------------------------------------------------------------------------
+
+/// Sentinel `flags` meaning "no explicit tag — derive the used bit".
+const DERIVE_USED: u32 = 0xFFFF_FFFF;
+
+/// Which bytes of one constant buffer the shader program reads.
+#[derive(Default)]
+struct CbReads {
+    /// Statically-addressed bytes.
+    bytes: BTreeSet<u32>,
+    /// Base byte offsets of dynamically-indexed arrays (`cb[base + r]`).
+    dyn_base: BTreeSet<u32>,
+    /// A fully dynamic index was seen; treat the whole buffer as read.
+    dyn_all: bool,
+}
+
+fn collect_cb_reads(op: &Operand, t: &mut BTreeMap<u32, CbReads>) {
+    for idx in op.indices.iter() {
+        if let OperandIndex::Relative(o) | OperandIndex::RelativePlusImm(_, o) = idx {
+            collect_cb_reads(o, t);
+        }
+    }
+    if op.reg_type != RegisterType::ConstantBuffer {
+        return;
+    }
+    let mut it = op.indices.iter();
+    let (Some(i0), Some(i1)) = (it.next(), it.next()) else {
+        return;
+    };
+    let OperandIndex::Imm32(reg) = i0 else { return };
+    let comps: Vec<u32> = match &op.components {
+        ComponentSelect::Swizzle(s) => {
+            let mut v: Vec<u32> = s.iter().map(|&c| c as u32).collect();
+            v.sort_unstable();
+            v.dedup();
+            v
+        }
+        ComponentSelect::Scalar(c) => alloc::vec![*c as u32],
+        _ => alloc::vec![0, 1, 2, 3],
+    };
+    let e = t.entry(*reg).or_default();
+    match i1 {
+        OperandIndex::Imm32(v) => {
+            let v = *v;
+            for c in &comps {
+                for b in 0..4 {
+                    e.bytes.insert(v * 16 + c * 4 + b);
+                }
+            }
+        }
+        OperandIndex::RelativePlusImm(base, _) => {
+            e.dyn_base.insert(*base * 16);
+        }
+        _ => e.dyn_all = true,
+    }
+}
+
+/// Map constant-buffer register → the bytes the program reads from it.
+fn cbuffer_reads(program: &Program) -> BTreeMap<u32, CbReads> {
+    let mut t = BTreeMap::new();
+    for ins in &program.instructions {
+        for op in ins.operands() {
+            collect_cb_reads(op, &mut t);
+        }
+    }
+    t
+}
+
+/// Whether any byte of `[offset, offset+size)` is read.
+fn var_used(r: &CbReads, offset: u32, size: u32) -> bool {
+    r.dyn_all
+        || r.dyn_base.iter().any(|&b| b >= offset && b < offset + size)
+        || (offset..offset + size).any(|b| r.bytes.contains(&b))
+}
+
+/// Reads for the constant buffer named `cb_name`, if its register is known.
+fn cb_reads_for<'a>(
+    rd: &ResourceDef<'_>,
+    reads: Option<&'a BTreeMap<u32, CbReads>>,
+    cb_name: &str,
+) -> Option<&'a CbReads> {
+    let reg = rd
+        .bindings
+        .iter()
+        .find(|b| b.name == cb_name && b.input_type == 0)?
+        .bind_point;
+    reads?.get(&reg)
+}
 
 // ---------------------------------------------------------------------------
 // Small helpers
@@ -324,7 +416,13 @@ fn emit_binding(o: &mut String, b: &ResourceBinding<'_>, rd: &ResourceDef<'_>) -
     Some(())
 }
 
-fn emit_var(o: &mut String, v: &CBufferVariable<'_>, indent: &str, sm5: bool) -> Option<()> {
+fn emit_var(
+    o: &mut String,
+    v: &CBufferVariable<'_>,
+    indent: &str,
+    sm5: bool,
+    cb_reads: Option<&CbReads>,
+) -> Option<()> {
     let t = &v.var_type;
     let tref = type_ref(t)?;
     let (stem, arr) = split_array(&tref);
@@ -342,10 +440,21 @@ fn emit_var(o: &mut String, v: &CBufferVariable<'_>, indent: &str, sm5: bool) ->
     if natural_size(t) != Some(v.size) {
         let _ = write!(o, " size={}", v.size);
     }
-    if v.flags == BIND_FLAG_USED {
-        o.push_str(" used");
-    } else if v.flags != 0 {
-        let _ = write!(o, " vflags={:x}", v.flags);
+    // The `used` flag is derived from the program when available; tag the
+    // variable only when the stored flags differ from that derivation.
+    let baseline = match cb_reads {
+        Some(r) if var_used(r, v.offset, v.size) => BIND_FLAG_USED,
+        Some(_) => 0,
+        None => 0,
+    };
+    if v.flags != baseline {
+        if v.flags == BIND_FLAG_USED {
+            o.push_str(" used");
+        } else if v.flags == 0 {
+            o.push_str(" unused");
+        } else {
+            let _ = write!(o, " vflags={:x}", v.flags);
+        }
     }
     if let Some(e) = &t.sm5_extra
         && *e != [0; 4]
@@ -376,8 +485,10 @@ fn emit_var(o: &mut String, v: &CBufferVariable<'_>, indent: &str, sm5: bool) ->
 
 /// Serialize an RDEF to editable HLSL. Returns `None` for anything this codec
 /// cannot model losslessly (caller falls back to the `key=value` form).
-pub fn rdef_to_hlsl(rd: &ResourceDef<'_>) -> Option<String> {
+pub fn rdef_to_hlsl(rd: &ResourceDef<'_>, program: Option<&Program>) -> Option<String> {
     let sm5 = is_sm5(rd.target_version);
+    let reads = program.map(cbuffer_reads);
+    let reads = reads.as_ref();
     let mut o = String::new();
     let _ = writeln!(o, "target {:08x}", rd.target_version);
     let _ = writeln!(o, "flags {:x}", rd.compile_flags);
@@ -465,15 +576,15 @@ pub fn rdef_to_hlsl(rd: &ResourceDef<'_>) -> Option<String> {
 
     // Body: prefer merged single-declaration cbuffers; fall back to the
     // two-section form when the array orderings don't allow a faithful merge.
-    if let Some(body) = emit_merged_body(rd, sm5) {
+    if let Some(body) = emit_merged_body(rd, sm5, reads) {
         let full = alloc::format!("{o}{body}");
-        if let Some(rd2) = rdef_from_hlsl(&full)
+        if let Some(rd2) = rdef_from_hlsl(&full, program)
             && rd2.to_writable().data == rd.to_writable().data
         {
             return Some(full);
         }
     }
-    let body = emit_twosection_body(rd, sm5)?;
+    let body = emit_twosection_body(rd, sm5, reads)?;
     Some(alloc::format!("{o}{body}"))
 }
 
@@ -483,6 +594,7 @@ fn emit_cbuffer_block(
     sm5: bool,
     register: Option<u32>,
     bind_flags: u32,
+    cb_reads: Option<&CbReads>,
 ) -> Option<()> {
     let _ = write!(o, "cbuffer {}", cb.name);
     if let Some(slot) = register {
@@ -499,14 +611,18 @@ fn emit_cbuffer_block(
     }
     o.push_str(" {\n");
     for v in &cb.variables {
-        emit_var(o, v, "    ", sm5)?;
+        emit_var(o, v, "    ", sm5, cb_reads)?;
     }
     o.push_str("};\n");
     Some(())
 }
 
 /// Two-section body: every binding as a declaration, then every cbuffer layout.
-fn emit_twosection_body(rd: &ResourceDef<'_>, sm5: bool) -> Option<String> {
+fn emit_twosection_body(
+    rd: &ResourceDef<'_>,
+    sm5: bool,
+    reads: Option<&BTreeMap<u32, CbReads>>,
+) -> Option<String> {
     let mut o = String::new();
     for b in &rd.bindings {
         emit_binding(&mut o, b, rd)?;
@@ -515,7 +631,8 @@ fn emit_twosection_body(rd: &ResourceDef<'_>, sm5: bool) -> Option<String> {
         o.push('\n');
     }
     for cb in &rd.constant_buffers {
-        emit_cbuffer_block(&mut o, cb, sm5, None, 0)?;
+        let cbr = cb_reads_for(rd, reads, cb.name.as_ref());
+        emit_cbuffer_block(&mut o, cb, sm5, None, 0, cbr)?;
     }
     Some(o)
 }
@@ -523,7 +640,11 @@ fn emit_twosection_body(rd: &ResourceDef<'_>, sm5: bool) -> Option<String> {
 /// Merged body: cbuffer bindings become single `cbuffer N : register(bN) {..}`
 /// blocks and resource cbuffer defs are reconstructed from their bindings.
 /// Returns None when binding order can't reproduce the cbuffer-def order.
-fn emit_merged_body(rd: &ResourceDef<'_>, sm5: bool) -> Option<String> {
+fn emit_merged_body(
+    rd: &ResourceDef<'_>,
+    sm5: bool,
+    reads: Option<&BTreeMap<u32, CbReads>>,
+) -> Option<String> {
     // Only merge when every cbuffer def is a plain register cbuffer (kind 0);
     // resource defs (structured buffers etc.) keep the two-section form so no
     // def has to be reconstructed from a binding.
@@ -545,7 +666,8 @@ fn emit_merged_body(rd: &ResourceDef<'_>, sm5: bool) -> Option<String> {
     for b in &rd.bindings {
         if b.input_type == 0 {
             let cb = rd.constant_buffers.iter().find(|c| c.name == b.name)?;
-            emit_cbuffer_block(&mut o, cb, sm5, Some(b.bind_point), b.flags)?;
+            let cbr = reads.and_then(|m| m.get(&b.bind_point));
+            emit_cbuffer_block(&mut o, cb, sm5, Some(b.bind_point), b.flags, cbr)?;
         } else {
             emit_binding(&mut o, b, rd)?;
         }
@@ -740,7 +862,8 @@ fn decode_typespec(spec: &str, regclass: char) -> Option<(u32, u32, u32)> {
 /// Parse a `key=value`-and-flags variable/member tail into the optional fields.
 struct VarTail {
     size: Option<u32>,
-    flags: u32,
+    /// `None` means no flag tag was present — derive the used bit on parse.
+    flags: Option<u32>,
     sm5: Option<[u32; 4]>,
     tex: Option<(u32, u32)>,
     samp: Option<(u32, u32)>,
@@ -749,14 +872,16 @@ struct VarTail {
 
 fn parse_var_tail<'a>(toks: impl Iterator<Item = &'a str> + Clone) -> Option<VarTail> {
     let m = kv(toks.clone());
-    let mut flags = 0u32;
+    let mut flags: Option<u32> = None;
     for t in toks {
         if t == "used" {
-            flags = BIND_FLAG_USED;
+            flags = Some(BIND_FLAG_USED);
+        } else if t == "unused" {
+            flags = Some(0);
         }
     }
     if let Some(v) = m.get("vflags") {
-        flags = u32::from_str_radix(v, 16).ok()?;
+        flags = Some(u32::from_str_radix(v, 16).ok()?);
     }
     let pair = |s: &str| -> Option<(u32, u32)> {
         let (a, b) = s.split_once(',')?;
@@ -788,7 +913,7 @@ fn parse_var_tail<'a>(toks: impl Iterator<Item = &'a str> + Clone) -> Option<Var
 }
 
 /// Parse HLSL text produced by [`rdef_to_hlsl`] back into an owned RDEF.
-pub fn rdef_from_hlsl(text: &str) -> Option<ResourceDef<'static>> {
+pub fn rdef_from_hlsl(text: &str, program: Option<&Program>) -> Option<ResourceDef<'static>> {
     let mut rd = ResourceDef {
         constant_buffers: Vec::new(),
         bindings: Vec::new(),
@@ -918,7 +1043,7 @@ pub fn rdef_from_hlsl(text: &str) -> Option<ResourceDef<'static>> {
                         name: Cow::Owned(String::from(vname)),
                         offset,
                         size,
-                        flags: tail.flags,
+                        flags: tail.flags.unwrap_or(DERIVE_USED),
                         var_type: vt,
                         default_value: Cow::Owned(tail.default),
                         texture_start: tail.tex.map(|t| t.0).or(if sm5 {
@@ -1071,6 +1196,29 @@ pub fn rdef_from_hlsl(text: &str) -> Option<ResourceDef<'static>> {
         .collect();
     for (i, s) in strides {
         rd.bindings[i].num_samples = s;
+    }
+
+    // Resolve cbuffer variables left as "derive" by computing the used bit from
+    // the program (or 0 when no program is available).
+    let reads = program.map(cbuffer_reads);
+    let regmap: BTreeMap<String, u32> = rd
+        .bindings
+        .iter()
+        .filter(|b| b.input_type == 0)
+        .map(|b| (String::from(b.name.as_ref()), b.bind_point))
+        .collect();
+    for cb in &mut rd.constant_buffers {
+        let cbr = regmap
+            .get(cb.name.as_ref())
+            .and_then(|r| reads.as_ref().and_then(|m| m.get(r)));
+        for v in &mut cb.variables {
+            if v.flags == DERIVE_USED {
+                v.flags = match cbr {
+                    Some(r) if var_used(r, v.offset, v.size) => BIND_FLAG_USED,
+                    _ => 0,
+                };
+            }
+        }
     }
     Some(rd)
 }

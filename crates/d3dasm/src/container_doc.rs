@@ -23,6 +23,7 @@ use core::fmt::Write;
 
 use dxbc::AsmError;
 use dxbc::chunks::WritableChunk;
+use dxbc::shex::Program;
 
 use crate::{Shader, forensic};
 
@@ -40,11 +41,19 @@ pub fn serialize(shader: &Shader) -> String {
     let _ = write!(out, "{}", container.version);
     out.push('\n');
 
+    // The shader program is used to derive RDEF metadata (e.g. cbuffer `used`
+    // flags), so decode it once up front.
+    let program = container
+        .chunks
+        .iter()
+        .find(|c| matches!(c.fourcc_str(), "SHEX" | "SHDR"))
+        .and_then(|c| dxbc::shex::decode_with_fourcc(c.data, c.fourcc).ok());
+
     for chunk in &container.chunks {
         // A chunk becomes an editable `.code` block only when we have a text
         // codec for it AND that codec is verified to round-trip these exact
         // bytes (see `chunk_to_body`); otherwise it is preserved as raw hex.
-        if let Some(body) = chunk_to_body(chunk.fourcc, chunk.data) {
+        if let Some(body) = chunk_to_body(chunk.fourcc, chunk.data, program.as_ref()) {
             let _ = writeln!(out, ".code {}", chunk.fourcc_str());
             out.push_str(&body);
         } else {
@@ -64,8 +73,9 @@ pub fn serialize(shader: &Shader) -> String {
 
 const SIGNATURE_FOURCCS: &[&[u8; 4]] = &[b"ISGN", b"ISG1", b"OSGN", b"OSG1", b"OSG5", b"PCSG", b"PSG1"];
 
-/// Editable text for a chunk, if a codec exists for its FourCC.
-fn encode_to_text(fourcc: [u8; 4], data: &[u8]) -> Option<String> {
+/// Editable text for a chunk, if a codec exists for its FourCC. `program` is
+/// the container's decoded shader program, used to derive RDEF `used` flags.
+fn encode_to_text(fourcc: [u8; 4], data: &[u8], program: Option<&Program>) -> Option<String> {
     if &fourcc == b"SHEX" || &fourcc == b"SHDR" {
         let program = dxbc::shex::decode_with_fourcc(data, fourcc).ok()?;
         return Some(dxbc::shex::serialize(&program));
@@ -86,8 +96,8 @@ fn encode_to_text(fourcc: [u8; 4], data: &[u8]) -> Option<String> {
         let rd = dxbc::chunks::rdef::parse_rdef(data)?;
         // Prefer the HLSL reconstruction when it round-trips byte-exactly;
         // otherwise the explicit key=value form (also lossless).
-        if let Some(hlsl) = dxbc::chunks::rdef_hlsl::rdef_to_hlsl(&rd)
-            && let Some(rd2) = dxbc::chunks::rdef_hlsl::rdef_from_hlsl(&hlsl)
+        if let Some(hlsl) = dxbc::chunks::rdef_hlsl::rdef_to_hlsl(&rd, program)
+            && let Some(rd2) = dxbc::chunks::rdef_hlsl::rdef_from_hlsl(&hlsl, program)
         {
             use dxbc::chunks::ChunkWriter;
             if rd2.to_writable().data == data {
@@ -100,7 +110,11 @@ fn encode_to_text(fourcc: [u8; 4], data: &[u8]) -> Option<String> {
 }
 
 /// Encode an editable chunk body back to raw chunk bytes.
-fn body_to_chunk(fourcc: [u8; 4], body: &str) -> Result<Vec<u8>, AsmError> {
+fn body_to_chunk(
+    fourcc: [u8; 4],
+    body: &str,
+    program: Option<&Program>,
+) -> Result<Vec<u8>, AsmError> {
     if &fourcc == b"SHEX" || &fourcc == b"SHDR" {
         let program = dxbc::shex::assemble(body)?;
         return Ok(dxbc::shex::encode(&program));
@@ -125,7 +139,7 @@ fn body_to_chunk(fourcc: [u8; 4], body: &str) -> Result<Vec<u8>, AsmError> {
             .find(|l| !l.is_empty())
             .is_some_and(|l| l.starts_with("target"));
         let rd = if is_hlsl {
-            dxbc::chunks::rdef_hlsl::rdef_from_hlsl(body)
+            dxbc::chunks::rdef_hlsl::rdef_from_hlsl(body, program)
                 .ok_or_else(|| err("malformed rdef hlsl"))?
         } else {
             dxbc::chunks::rdef::rdef_from_text(body).ok_or_else(|| err("malformed rdef text"))?
@@ -138,9 +152,9 @@ fn body_to_chunk(fourcc: [u8; 4], body: &str) -> Result<Vec<u8>, AsmError> {
 /// Editable body for a chunk, but only when re-encoding it reproduces the
 /// original bytes exactly — so an imperfect codec silently falls back to raw
 /// hex and byte-identity is never at risk.
-fn chunk_to_body(fourcc: [u8; 4], data: &[u8]) -> Option<String> {
-    let body = encode_to_text(fourcc, data)?;
-    let rebuilt = body_to_chunk(fourcc, &body).ok()?;
+fn chunk_to_body(fourcc: [u8; 4], data: &[u8], program: Option<&Program>) -> Option<String> {
+    let body = encode_to_text(fourcc, data, program)?;
+    let rebuilt = body_to_chunk(fourcc, &body, program).ok()?;
     if rebuilt == data { Some(body) } else { None }
 }
 
@@ -152,6 +166,28 @@ fn write_hex_block(out: &mut String, data: &[u8]) {
         }
         out.push('\n');
     }
+}
+
+/// Find and assemble the `.code SHEX`/`SHDR` block (from already comment-stripped
+/// lines) into a program, so RDEF can derive metadata from it.
+fn assemble_program(lines: &[&str], start: usize) -> Option<Program> {
+    let mut i = start;
+    while i < lines.len() && lines[i] != ".end" {
+        if let Some(fc) = lines[i].strip_prefix(".code ") {
+            if matches!(fc.trim(), "SHEX" | "SHDR") {
+                let mut body = String::new();
+                let mut j = i + 1;
+                while j < lines.len() && !lines[j].starts_with('.') {
+                    body.push_str(lines[j]);
+                    body.push('\n');
+                    j += 1;
+                }
+                return dxbc::shex::assemble(&body).ok();
+            }
+        }
+        i += 1;
+    }
+    None
 }
 
 /// Assemble a forensic `.d3dasm` document back into byte-identical container
@@ -168,6 +204,10 @@ pub fn assemble(text: &str) -> Result<Vec<u8>, AsmError> {
     let header = lines.first().ok_or_else(|| err("empty container document"))?;
     let version = parse_dxbc_directive(header)?;
     idx += 1;
+
+    // Assemble the shader program first; RDEF derives metadata (cbuffer `used`
+    // flags) from it, so it must be available before the RDEF chunk is built.
+    let program = assemble_program(&lines, idx);
 
     let mut chunks: Vec<WritableChunk> = Vec::new();
     while idx < lines.len() {
@@ -186,7 +226,7 @@ pub fn assemble(text: &str) -> Result<Vec<u8>, AsmError> {
             }
             chunks.push(WritableChunk {
                 fourcc,
-                data: body_to_chunk(fourcc, &body)?,
+                data: body_to_chunk(fourcc, &body, program.as_ref())?,
             });
         } else if let Some(fourcc) = line.strip_prefix(".chunk ") {
             let fourcc = parse_fourcc(fourcc.trim())?;
