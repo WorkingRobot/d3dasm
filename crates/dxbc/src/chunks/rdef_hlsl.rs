@@ -210,6 +210,23 @@ fn type_ref(td: &TypeDesc<'_>) -> Option<String> {
     hlsl_type_name(td)
 }
 
+/// Split a `type[N]` spelling into `(stem, Some(N-text))` (array on the type),
+/// so the caller can move the suffix onto the variable name (proper HLSL).
+fn split_array(tref: &str) -> (&str, Option<&str>) {
+    match tref.split_once('[') {
+        Some((s, rest)) => (s, rest.strip_suffix(']')),
+        None => (tref, None),
+    }
+}
+
+/// Split a `name[N]` token into `(name, elements)`.
+fn split_name(tok: &str) -> Option<(&str, u16)> {
+    match tok.split_once('[') {
+        Some((n, rest)) => Some((n, rest.strip_suffix(']')?.parse().ok()?)),
+        None => Some((tok, 0)),
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Emit
 // ---------------------------------------------------------------------------
@@ -270,15 +287,26 @@ fn emit_binding(o: &mut String, b: &ResourceBinding<'_>, rd: &ResourceDef<'_>) -
     if b.bind_count != 1 {
         let _ = write!(o, "[{}]", b.bind_count);
     }
-    // Annotations for fields the typespec does not capture.
-    if !is_texture(b.input_type) && b.dimension != 0 {
+    // Annotations for fields the typespec does not capture. Structured buffers
+    // always carry dimension=Buffer(1) and return=mixed(6), and textures default
+    // to the -1 "not multisampled" sentinel — all derived on parse.
+    let structured = matches!(b.input_type, 5 | 6 | 9 | 10 | 11);
+    let dim_default = if structured { 1 } else { 0 };
+    let ret_default = if structured { 6 } else { 0 };
+    if !is_texture(b.input_type) && b.dimension != dim_default {
         let _ = write!(o, " dim={}", b.dimension);
     }
-    if !is_texture(b.input_type) && b.return_type != 0 {
+    if !is_texture(b.input_type) && b.return_type != ret_default {
         let _ = write!(o, " ret={}", b.return_type);
     }
-    if b.num_samples == 0xFFFF_FFFF {
-        o.push_str(" samples=-1");
+    if structured {
+        if b.num_samples != 0 {
+            let _ = write!(o, " stride={}", b.num_samples);
+        }
+    } else if is_texture(b.input_type) {
+        if b.num_samples != 0xFFFF_FFFF {
+            let _ = write!(o, " samples={}", b.num_samples);
+        }
     } else if b.num_samples != 0 {
         let _ = write!(o, " samples={}", b.num_samples);
     }
@@ -292,11 +320,15 @@ fn emit_binding(o: &mut String, b: &ResourceBinding<'_>, rd: &ResourceDef<'_>) -
 fn emit_var(o: &mut String, v: &CBufferVariable<'_>, indent: &str, sm5: bool) -> Option<()> {
     let t = &v.var_type;
     let tref = type_ref(t)?;
+    let (stem, arr) = split_array(&tref);
     o.push_str(indent);
     if t.class == 2 {
         o.push_str("row_major ");
     }
-    let _ = write!(o, "{tref} {}", v.name);
+    let _ = write!(o, "{stem} {}", v.name);
+    if let Some(n) = arr {
+        let _ = write!(o, "[{n}]");
+    }
     let po = packoffset_str(v.offset)?;
     let _ = write!(o, " : packoffset({po})");
     // size: omit when it matches the natural size of a non-array type.
@@ -365,20 +397,25 @@ pub fn rdef_to_hlsl(rd: &ResourceDef<'_>) -> Option<String> {
                 continue;
             }
             seen_structs.push(name);
+            // A struct type descriptor stores rows=1 and cols=size/4; both are
+            // derived on parse, so only deviations need annotating.
+            let struct_size: u32 = t
+                .members
+                .iter()
+                .filter_map(|m| natural_size(&m.member_type).map(|s| m.offset + s))
+                .max()
+                .unwrap_or(0);
             let _ = write!(o, "struct {name}");
-            // A struct type descriptor carries non-obvious scalar fields
-            // (fxc stores rows=1, cols=size/4). Preserve any that aren't the
-            // struct defaults (class 5, the rest 0).
             if t.class != 5 {
                 let _ = write!(o, " class={}", t.class);
             }
             if t.var_type != 0 {
                 let _ = write!(o, " vtype={}", t.var_type);
             }
-            if t.rows != 0 {
+            if t.rows != 1 {
                 let _ = write!(o, " rows={}", t.rows);
             }
-            if t.columns != 0 {
+            if t.columns as u32 != struct_size / 4 {
                 let _ = write!(o, " cols={}", t.columns);
             }
             if let Some(e) = &t.sm5_extra
@@ -387,21 +424,32 @@ pub fn rdef_to_hlsl(rd: &ResourceDef<'_>) -> Option<String> {
                 let _ = write!(o, " sm5={:x},{:x},{:x},{:x}", e[0], e[1], e[2], e[3]);
             }
             o.push_str(" {\n");
+            // Members are tightly packed; emit `+offset` only when one breaks
+            // the running natural-size layout.
+            let mut running = 0u32;
             for m in &t.members {
                 let mref = type_ref(&m.member_type)?;
+                let (stem, arr) = split_array(&mref);
                 o.push_str("    ");
                 if m.member_type.class == 2 {
                     o.push_str("row_major ");
                 }
-                let _ = write!(o, "{mref} {} +{}", m.name, m.offset);
+                let _ = write!(o, "{stem} {}", m.name);
+                if let Some(n) = arr {
+                    let _ = write!(o, "[{n}]");
+                }
+                if m.offset != running {
+                    let _ = write!(o, " +{}", m.offset);
+                }
                 if let Some(e) = &m.member_type.sm5_extra
                     && *e != [0; 4]
                 {
                     let _ = write!(o, " sm5={:x},{:x},{:x},{:x}", e[0], e[1], e[2], e[3]);
                 }
                 o.push_str(";\n");
+                running = m.offset + natural_size(&m.member_type).unwrap_or(0);
             }
-            o.push_str("}\n");
+            o.push_str("};\n");
         }
     }
     if !seen_structs.is_empty() {
@@ -429,7 +477,7 @@ pub fn rdef_to_hlsl(rd: &ResourceDef<'_>) -> Option<String> {
         for v in &cb.variables {
             emit_var(&mut o, v, "    ", sm5)?;
         }
-        o.push_str("}\n");
+        o.push_str("};\n");
     }
     Some(o)
 }
@@ -543,15 +591,32 @@ fn parse_binding(line: &str) -> Option<ResourceBinding<'static>> {
 
     // Decode the typespec into input_type / dimension / return_type.
     let (input_type, mut dimension, mut return_type) = decode_typespec(spec, regclass)?;
+    let structured = matches!(input_type, 5 | 6 | 9 | 10 | 11);
+    if structured {
+        dimension = 1; // Buffer
+        return_type = 6; // mixed
+    }
     if let Some(d) = m.get("dim") {
         dimension = d.parse().ok()?;
     }
     if let Some(r) = m.get("ret") {
         return_type = r.parse().ok()?;
     }
-    let num_samples = match m.get("samples") {
-        Some(s) => s.parse::<i64>().ok()? as u32, // accepts -1 sentinel
-        None => 0,
+    let num_samples = if structured {
+        match m.get("stride") {
+            Some(s) => s.parse().ok()?,
+            None => 0,
+        }
+    } else if is_texture(input_type) {
+        match m.get("samples") {
+            Some(s) => s.parse().ok()?,
+            None => 0xFFFF_FFFF, // not multisampled
+        }
+    } else {
+        match m.get("samples") {
+            Some(s) => s.parse::<i64>().ok()? as u32,
+            None => 0,
+        }
     };
     let flags = match m.get("flags") {
         Some(s) => bind_flags_from(s)?,
@@ -668,8 +733,8 @@ pub fn rdef_from_hlsl(text: &str) -> Option<ResourceDef<'static>> {
         name: String,
         class: u16,
         var_type: u16,
-        rows: u16,
-        cols: u16,
+        rows: Option<u16>,
+        cols: Option<u16>,
         sm5: Option<[u32; 4]>,
     }
     enum Block {
@@ -685,14 +750,20 @@ pub fn rdef_from_hlsl(text: &str) -> Option<ResourceDef<'static>> {
             continue;
         }
         // End of a block.
-        if line == "}" {
+        if line == "}" || line == "};" {
             match block.take()? {
                 Block::Struct(hdr, members) => {
+                    // Derive rows=1 and cols=size/4 unless overridden.
+                    let struct_size: u32 = members
+                        .iter()
+                        .filter_map(|m| natural_size(&m.member_type).map(|s| m.offset + s))
+                        .max()
+                        .unwrap_or(0);
                     let td = TypeDesc {
                         class: hdr.class,
                         var_type: hdr.var_type,
-                        rows: hdr.rows,
-                        columns: hdr.cols,
+                        rows: hdr.rows.unwrap_or(1),
+                        columns: hdr.cols.unwrap_or((struct_size / 4) as u16),
                         elements: 0,
                         members,
                         sm5_extra: hdr.sm5.or(if sm5 { Some([0; 4]) } else { None }),
@@ -709,7 +780,8 @@ pub fn rdef_from_hlsl(text: &str) -> Option<ResourceDef<'static>> {
         if let Some(b) = &mut block {
             match b {
                 Block::Struct(_, members) => {
-                    // `<type> <name> +<offset> [sm5=..];`
+                    // `<type> <name> [+<offset>] [sm5=..];` — offset defaults to
+                    // the running tight-packed position.
                     let body = line.strip_suffix(';').unwrap_or(line);
                     let mut toks = body.split_whitespace();
                     let mut t0 = toks.next()?;
@@ -717,11 +789,21 @@ pub fn rdef_from_hlsl(text: &str) -> Option<ResourceDef<'static>> {
                     if row_major {
                         t0 = toks.next()?;
                     }
-                    let mname = toks.next()?;
-                    let off_tok = toks.next()?;
-                    let offset: u32 = off_tok.strip_prefix('+')?.parse().ok()?;
-                    let m = kv(toks.clone());
+                    let mname_tok = toks.next()?;
+                    let (mname, arr) = split_name(mname_tok)?;
+                    let rest: Vec<&str> = toks.collect();
+                    let offset: u32 = match rest.iter().find_map(|t| t.strip_prefix('+')) {
+                        Some(s) => s.parse().ok()?,
+                        None => members
+                            .last()
+                            .map(|m| m.offset + natural_size(&m.member_type).unwrap_or(0))
+                            .unwrap_or(0),
+                    };
+                    let m = kv(rest.iter().copied());
                     let mut mt = resolve_type(t0, row_major, &structs, sm5)?;
+                    if arr > 0 {
+                        mt.elements = arr;
+                    }
                     if let Some(s) = m.get("sm5") {
                         mt.sm5_extra = Some(parse_sm5(s)?);
                     }
@@ -739,7 +821,8 @@ pub fn rdef_from_hlsl(text: &str) -> Option<ResourceDef<'static>> {
                     if row_major {
                         t0 = toks.next()?;
                     }
-                    let vname = toks.next()?;
+                    let vname_tok = toks.next()?;
+                    let (vname, arr) = split_name(vname_tok)?;
                     // Expect `: packoffset(...)`.
                     let _colon = toks.next()?; // ":"
                     let po_tok = toks.next()?; // "packoffset(cN...)"
@@ -749,6 +832,9 @@ pub fn rdef_from_hlsl(text: &str) -> Option<ResourceDef<'static>> {
                     let offset = packoffset_parse(po)?;
                     let tail = parse_var_tail(toks)?;
                     let mut vt = resolve_type(t0, row_major, &structs, sm5)?;
+                    if arr > 0 {
+                        vt.elements = arr;
+                    }
                     if let Some(e) = tail.sm5 {
                         vt.sm5_extra = Some(e);
                     }
@@ -805,18 +891,24 @@ pub fn rdef_from_hlsl(text: &str) -> Option<ResourceDef<'static>> {
                 let mut it = inner.split_whitespace();
                 let name = it.next()?;
                 let m = kv(it);
-                let getu = |k: &str, d: u16| -> Option<u16> {
-                    match m.get(k) {
-                        Some(s) => s.parse().ok(),
-                        None => Some(d),
-                    }
-                };
                 let hdr = StructHdr {
                     name: String::from(name),
-                    class: getu("class", 5)?,
-                    var_type: getu("vtype", 0)?,
-                    rows: getu("rows", 0)?,
-                    cols: getu("cols", 0)?,
+                    class: match m.get("class") {
+                        Some(s) => s.parse().ok()?,
+                        None => 5,
+                    },
+                    var_type: match m.get("vtype") {
+                        Some(s) => s.parse().ok()?,
+                        None => 0,
+                    },
+                    rows: match m.get("rows") {
+                        Some(s) => Some(s.parse().ok()?),
+                        None => None,
+                    },
+                    cols: match m.get("cols") {
+                        Some(s) => Some(s.parse().ok()?),
+                        None => None,
+                    },
                     sm5: match m.get("sm5") {
                         Some(s) => Some(parse_sm5(s)?),
                         None => None,
