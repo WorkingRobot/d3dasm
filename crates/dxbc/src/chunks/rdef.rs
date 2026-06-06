@@ -17,7 +17,7 @@ use core::fmt;
 use nostdio::{ReadLe, Seek, SeekFrom, SliceCursor};
 
 use super::ChunkWriter;
-use crate::util::{StringTableWriter, read_cstring};
+use crate::util::read_cstring;
 
 /// Parsed RDEF chunk — constant buffers, resource bindings, and creator string.
 #[derive(Debug)]
@@ -84,7 +84,7 @@ pub struct CBufferVariable<'a> {
 ///   8: `[elements:16 | members:16]`
 ///  12: member descriptor offset
 /// SM5 adds 4 unknown u32s + 1 name offset u32.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct TypeDesc<'a> {
     /// Variable class (scalar, vector, matrix, object, struct).
     pub class: u16,
@@ -110,7 +110,7 @@ pub struct TypeDesc<'a> {
 ///   0: u32 name offset
 ///   4: u32 type offset (recursive)
 ///   8: u32 byte offset within parent
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct MemberDesc<'a> {
     /// Member name.
     pub name: Cow<'a, str>,
@@ -629,51 +629,81 @@ impl ResourceDef<'_> {
     fn is_sm5(&self) -> bool {
         ((self.target_version >> 8) & 0xFF) >= 5
     }
+}
 
-    fn var_stride(&self) -> usize {
-        if self.is_sm5() { 40 } else { 24 }
+// Low-level helpers for the byte-exact RDEF writer.
+
+fn push_u32(out: &mut Vec<u8>, v: u32) {
+    out.extend_from_slice(&v.to_le_bytes());
+}
+
+fn patch_u32(out: &mut [u8], pos: usize, v: u32) {
+    out[pos..pos + 4].copy_from_slice(&v.to_le_bytes());
+}
+
+/// Pad `out` to a 4-byte boundary with fxc's 0xAB fill byte.
+fn pad4(out: &mut Vec<u8>) {
+    while out.len() % 4 != 0 {
+        out.push(0xAB);
     }
+}
 
-    /// Collect all type descriptors from the variable tree, returning
-    /// a de-duplicated list in encounter order. Each entry is an index
-    /// into the returned Vec; the index is stored alongside each variable.
-    fn collect_types(&self) -> (Vec<&TypeDesc<'_>>, Vec<Vec<usize>>) {
-        // types[i] = &TypeDesc, cb_var_type_idx[cb][var] = index into types.
-        // We deduplicate by address (identity) using the pointer value as a
-        // plain usize key — no unsafe dereference needed.
-        let mut types: Vec<&TypeDesc<'_>> = Vec::new();
-        let mut seen: Vec<usize> = Vec::new(); // address-identity keys
-        let mut cb_var_idx: Vec<Vec<usize>> = Vec::new();
-
-        fn register<'a>(
-            td: &'a TypeDesc<'a>,
-            types: &mut Vec<&'a TypeDesc<'a>>,
-            seen: &mut Vec<usize>,
-        ) -> usize {
-            let addr = td as *const TypeDesc<'a> as usize;
-            if let Some(pos) = seen.iter().position(|&a| a == addr) {
-                return pos;
-            }
-            let idx = types.len();
-            types.push(td);
-            seen.push(addr);
-            for m in &td.members {
-                register(&m.member_type, types, seen);
-            }
-            idx
-        }
-
-        for cb in &self.constant_buffers {
-            let mut var_idxs = Vec::with_capacity(cb.variables.len());
-            for v in &cb.variables {
-                let idx = register(&v.var_type, &mut types, &mut seen);
-                var_idxs.push(idx);
-            }
-            cb_var_idx.push(var_idxs);
-        }
-
-        (types, cb_var_idx)
+/// Intern a null-terminated string into a single content-deduped pool,
+/// appending it at the current end of `out` on first use.
+fn intern(out: &mut Vec<u8>, pool: &mut alloc::collections::BTreeMap<alloc::string::String, u32>, s: &str) -> u32 {
+    if let Some(&off) = pool.get(s) {
+        return off;
     }
+    let off = out.len() as u32;
+    out.extend_from_slice(s.as_bytes());
+    out.push(0);
+    pool.insert(alloc::string::String::from(s), off);
+    off
+}
+
+/// Resolve a variable's type to a descriptor offset, reproducing fxc's sharing:
+/// non-array types (`elements == 0`) are de-duplicated by value; array types
+/// always get a fresh descriptor. Returns the assigned offset, placing the
+/// type's name string + descriptor at the current cursor on first emission.
+///
+/// Struct members are not laid out here, so types with members won't reproduce
+/// exactly — those RDEFs fall back to raw hex via the emit-time verification.
+fn place_type<'a>(
+    out: &mut Vec<u8>,
+    pool: &mut alloc::collections::BTreeMap<alloc::string::String, u32>,
+    placed: &mut Vec<(TypeDesc<'a>, u32)>,
+    td: &TypeDesc<'a>,
+    is_sm5: bool,
+) -> u32 {
+    if td.elements == 0 {
+        if let Some((_, off)) = placed.iter().find(|(t, _)| t == td) {
+            return *off;
+        }
+    }
+    let name_off = if td.name.is_empty() {
+        0
+    } else {
+        intern(out, pool, &td.name)
+    };
+    pad4(out);
+    let off = out.len() as u32;
+    push_u32(out, (td.class as u32) | ((td.var_type as u32) << 16));
+    push_u32(out, (td.rows as u32) | ((td.columns as u32) << 16));
+    push_u32(out, (td.elements as u32) | ((td.members.len() as u32) << 16));
+    push_u32(out, 0); // member descriptor offset (members not laid out)
+    if is_sm5 {
+        match &td.sm5_extra {
+            Some(e) => {
+                for x in e {
+                    push_u32(out, *x);
+                }
+            }
+            None => out.extend_from_slice(&[0u8; 16]),
+        }
+        push_u32(out, name_off);
+    }
+    placed.push((td.clone(), off));
+    off
 }
 
 impl ChunkWriter for ResourceDef<'_> {
@@ -682,234 +712,129 @@ impl ChunkWriter for ResourceDef<'_> {
     }
 
     fn write_payload(&self) -> Vec<u8> {
+        use alloc::collections::BTreeMap;
+        use alloc::string::String;
+
         let is_sm5 = self.is_sm5();
-        let var_stride = self.var_stride();
+        let rd11_size = if self.rd11_extra.is_some() { 32 } else { 0 };
 
-        // Pass 1: calculate section sizes and offsets.
-        let header_size: usize = 28;
-        let rd11_size: usize = if self.rd11_extra.is_some() { 32 } else { 0 };
-        let bindings_size = self.bindings.len() * 32;
-        let cb_desc_size = self.constant_buffers.len() * 24;
-        let total_vars: usize = self
-            .constant_buffers
-            .iter()
-            .map(|cb| cb.variables.len())
-            .sum();
-        let vars_size = total_vars * var_stride;
+        let mut out: Vec<u8> = Vec::new();
+        // Binding/cbuffer names share one pool; variable + type names use a
+        // separate pool (fxc does not dedup variable names against bindings).
+        let mut bpool: BTreeMap<String, u32> = BTreeMap::new();
+        let mut vpool: BTreeMap<String, u32> = BTreeMap::new();
 
-        // Collect types for writing
-        let (types, cb_var_type_idx) = self.collect_types();
-        let type_desc_stride: usize = if is_sm5 { 36 } else { 16 };
-        // Count member descriptors
-        let total_members: usize = types.iter().map(|t| t.members.len()).sum();
-        let types_size = types.len() * type_desc_stride;
-        let members_size = total_members * 12;
+        // Header (28 bytes). cb_offset and creator_offset are patched later.
+        push_u32(&mut out, self.constant_buffers.len() as u32);
+        let cb_off_pos = out.len();
+        push_u32(&mut out, 0);
+        push_u32(&mut out, self.bindings.len() as u32);
+        push_u32(&mut out, (28 + rd11_size) as u32); // binding section always present
+        push_u32(&mut out, self.target_version);
+        push_u32(&mut out, self.compile_flags);
+        let creator_pos = out.len();
+        push_u32(&mut out, 0);
 
-        // Default value blobs
-        let mut default_blobs: Vec<(&[u8], usize)> = Vec::new(); // (data, absolute_offset)
-        let default_values_start = header_size
-            + rd11_size
-            + bindings_size
-            + cb_desc_size
-            + vars_size
-            + types_size
-            + members_size;
-        let mut dv_cursor = default_values_start;
-        for cb in &self.constant_buffers {
-            for v in &cb.variables {
-                if !v.default_value.is_empty() {
-                    default_blobs.push((&v.default_value, dv_cursor));
-                    dv_cursor += v.default_value.len();
-                }
-            }
-        }
-        let default_values_size = dv_cursor - default_values_start;
-
-        let string_table_base = header_size
-            + rd11_size
-            + bindings_size
-            + cb_desc_size
-            + vars_size
-            + types_size
-            + members_size
-            + default_values_size;
-        let mut st = StringTableWriter::new(string_table_base);
-
-        // Pass 2: register all strings.
-        st.add(&self.creator);
-        for b in &self.bindings {
-            st.add(&b.name);
-        }
-        for cb in &self.constant_buffers {
-            st.add(&cb.name);
-            for v in &cb.variables {
-                st.add(&v.name);
-            }
-        }
-        for td in &types {
-            if !td.name.is_empty() {
-                st.add(&td.name);
-            }
-            for m in &td.members {
-                st.add(&m.name);
-            }
-        }
-
-        let total_size = string_table_base + st.len();
-        let mut out = Vec::with_capacity(total_size);
-
-        // Offsets for header. `binding_offset` always points at the (possibly
-        // empty) binding section; `cb_offset` is 0 when there are no cbuffers.
-        let binding_offset = header_size + rd11_size;
-        let cb_offset = binding_offset + bindings_size;
-        let cb_offset_field = if self.constant_buffers.is_empty() {
-            0
-        } else {
-            cb_offset as u32
-        };
-
-        // Write header (28 bytes)
-        out.extend_from_slice(&(self.constant_buffers.len() as u32).to_le_bytes());
-        out.extend_from_slice(&cb_offset_field.to_le_bytes());
-        out.extend_from_slice(&(self.bindings.len() as u32).to_le_bytes());
-        out.extend_from_slice(&(binding_offset as u32).to_le_bytes());
-        out.extend_from_slice(&self.target_version.to_le_bytes());
-        out.extend_from_slice(&self.compile_flags.to_le_bytes());
-        out.extend_from_slice(&st.add(&self.creator).to_le_bytes());
-
-        // Write RD11 sub-header if present
         if let Some(rd11) = &self.rd11_extra {
             for v in rd11 {
-                out.extend_from_slice(&v.to_le_bytes());
+                push_u32(&mut out, *v);
             }
         }
 
-        // Write resource bindings (32 bytes each)
+        // Resource bindings, then their name strings (cbuffer names share these).
+        let mut binding_name_pos = Vec::with_capacity(self.bindings.len());
         for b in &self.bindings {
-            out.extend_from_slice(&st.add(&b.name).to_le_bytes());
-            out.extend_from_slice(&b.input_type.to_le_bytes());
-            out.extend_from_slice(&b.return_type.to_le_bytes());
-            out.extend_from_slice(&b.dimension.to_le_bytes());
-            out.extend_from_slice(&b.num_samples.to_le_bytes());
-            out.extend_from_slice(&b.bind_point.to_le_bytes());
-            out.extend_from_slice(&b.bind_count.to_le_bytes());
-            out.extend_from_slice(&b.flags.to_le_bytes());
+            binding_name_pos.push(out.len());
+            push_u32(&mut out, 0);
+            push_u32(&mut out, b.input_type);
+            push_u32(&mut out, b.return_type);
+            push_u32(&mut out, b.dimension);
+            push_u32(&mut out, b.num_samples);
+            push_u32(&mut out, b.bind_point);
+            push_u32(&mut out, b.bind_count);
+            push_u32(&mut out, b.flags);
+        }
+        for (i, b) in self.bindings.iter().enumerate() {
+            let off = intern(&mut out, &mut bpool, &b.name);
+            patch_u32(&mut out, binding_name_pos[i], off);
         }
 
-        // Write CBuffer descriptors (24 bytes each)
-        // We need to know where each cbuffer's variables start.
-        let vars_base = cb_offset + cb_desc_size;
-        let mut var_cursor = vars_base;
+        // Constant-buffer descriptors (cb_offset is 0 when there are none).
+        // Only align when a cbuffer section follows.
+        if !self.constant_buffers.is_empty() {
+            pad4(&mut out);
+        }
+        let cb_section = out.len() as u32;
+        patch_u32(
+            &mut out,
+            cb_off_pos,
+            if self.constant_buffers.is_empty() { 0 } else { cb_section },
+        );
+        let mut cb_name_pos = Vec::with_capacity(self.constant_buffers.len());
+        let mut cb_var_pos = Vec::with_capacity(self.constant_buffers.len());
         for cb in &self.constant_buffers {
-            out.extend_from_slice(&st.add(&cb.name).to_le_bytes());
-            out.extend_from_slice(&(cb.variables.len() as u32).to_le_bytes());
-            out.extend_from_slice(&(var_cursor as u32).to_le_bytes());
-            out.extend_from_slice(&cb.size.to_le_bytes());
-            out.extend_from_slice(&cb.flags.to_le_bytes());
-            out.extend_from_slice(&cb.cb_type.to_le_bytes());
-            var_cursor += cb.variables.len() * var_stride;
+            cb_name_pos.push(out.len());
+            push_u32(&mut out, 0);
+            push_u32(&mut out, cb.variables.len() as u32);
+            cb_var_pos.push(out.len());
+            push_u32(&mut out, 0);
+            push_u32(&mut out, cb.size);
+            push_u32(&mut out, cb.flags);
+            push_u32(&mut out, cb.cb_type);
+        }
+        for (i, cb) in self.constant_buffers.iter().enumerate() {
+            let off = intern(&mut out, &mut bpool, &cb.name);
+            patch_u32(&mut out, cb_name_pos[i], off);
         }
 
-        // Pre-compute type descriptor offsets and member descriptor offsets.
-        let types_base = vars_base + vars_size;
-        let mut type_offsets: Vec<usize> = Vec::with_capacity(types.len());
-        for i in 0..types.len() {
-            type_offsets.push(types_base + i * type_desc_stride);
-        }
-        // Member descriptors come right after all type descriptors
-        let members_base = types_base + types_size;
-        let mut member_offsets: Vec<usize> = Vec::with_capacity(types.len());
-        let mut mcursor = members_base;
-        for td in &types {
-            member_offsets.push(mcursor);
-            mcursor += td.members.len() * 12;
-        }
+        // Per cbuffer: variable descriptors, then per-variable name/type/default.
+        let mut placed_types: Vec<(TypeDesc<'_>, u32)> = Vec::new();
+        for (ci, cb) in self.constant_buffers.iter().enumerate() {
+            pad4(&mut out);
+            let var_section = out.len() as u32;
+            patch_u32(&mut out, cb_var_pos[ci], var_section);
 
-        // Write variable descriptors
-        let mut dv_write_cursor = default_values_start;
-        for (cb_idx, cb) in self.constant_buffers.iter().enumerate() {
-            for (v_idx, v) in cb.variables.iter().enumerate() {
-                out.extend_from_slice(&st.add(&v.name).to_le_bytes());
-                out.extend_from_slice(&v.offset.to_le_bytes());
-                out.extend_from_slice(&v.size.to_le_bytes());
-                out.extend_from_slice(&v.flags.to_le_bytes());
-                let tidx = cb_var_type_idx[cb_idx][v_idx];
-                out.extend_from_slice(&(type_offsets[tidx] as u32).to_le_bytes());
-                if v.default_value.is_empty() {
-                    out.extend_from_slice(&0u32.to_le_bytes());
-                } else {
-                    out.extend_from_slice(&(dv_write_cursor as u32).to_le_bytes());
-                    dv_write_cursor += v.default_value.len();
-                }
-                if is_sm5 {
-                    out.extend_from_slice(&v.texture_start.unwrap_or(SLOT_UNUSED).to_le_bytes());
-                    out.extend_from_slice(&v.texture_size.unwrap_or(0).to_le_bytes());
-                    out.extend_from_slice(&v.sampler_start.unwrap_or(SLOT_UNUSED).to_le_bytes());
-                    out.extend_from_slice(&v.sampler_size.unwrap_or(0).to_le_bytes());
-                }
-            }
-        }
-
-        // Write type descriptors
-        for (i, td) in types.iter().enumerate() {
-            let class_type = (td.class as u32) | ((td.var_type as u32) << 16);
-            let rows_cols = (td.rows as u32) | ((td.columns as u32) << 16);
-            let elems_members = (td.elements as u32) | ((td.members.len() as u32) << 16);
-            let moff = if td.members.is_empty() {
-                0u32
-            } else {
-                member_offsets[i] as u32
-            };
-            out.extend_from_slice(&class_type.to_le_bytes());
-            out.extend_from_slice(&rows_cols.to_le_bytes());
-            out.extend_from_slice(&elems_members.to_le_bytes());
-            out.extend_from_slice(&moff.to_le_bytes());
-            if is_sm5 {
-                if let Some(extra) = &td.sm5_extra {
-                    for v in extra {
-                        out.extend_from_slice(&v.to_le_bytes());
-                    }
-                } else {
-                    for _ in 0..4 {
-                        out.extend_from_slice(&0u32.to_le_bytes());
-                    }
-                }
-                let name_off = if td.name.is_empty() {
-                    0u32
-                } else {
-                    st.add(&td.name)
-                };
-                out.extend_from_slice(&name_off.to_le_bytes());
-            }
-        }
-
-        // Write member descriptors
-        for td in &types {
-            for m in &td.members {
-                out.extend_from_slice(&st.add(&m.name).to_le_bytes());
-                // Find the type index for this member's type
-                let mtype_addr = &m.member_type as *const TypeDesc<'_> as usize;
-                let mtype_idx = types
-                    .iter()
-                    .position(|t| (*t as *const TypeDesc<'_> as usize) == mtype_addr)
-                    .unwrap_or(0);
-                out.extend_from_slice(&(type_offsets[mtype_idx] as u32).to_le_bytes());
-                out.extend_from_slice(&m.offset.to_le_bytes());
-            }
-        }
-
-        // Write default value blobs
-        for cb in &self.constant_buffers {
+            let mut name_pos = Vec::with_capacity(cb.variables.len());
+            let mut type_pos = Vec::with_capacity(cb.variables.len());
+            let mut def_pos = Vec::with_capacity(cb.variables.len());
             for v in &cb.variables {
-                if !v.default_value.is_empty() {
+                name_pos.push(out.len());
+                push_u32(&mut out, 0);
+                push_u32(&mut out, v.offset);
+                push_u32(&mut out, v.size);
+                push_u32(&mut out, v.flags);
+                type_pos.push(out.len());
+                push_u32(&mut out, 0);
+                def_pos.push(out.len());
+                push_u32(&mut out, 0);
+                if is_sm5 {
+                    push_u32(&mut out, v.texture_start.unwrap_or(SLOT_UNUSED));
+                    push_u32(&mut out, v.texture_size.unwrap_or(0));
+                    push_u32(&mut out, v.sampler_start.unwrap_or(SLOT_UNUSED));
+                    push_u32(&mut out, v.sampler_size.unwrap_or(0));
+                }
+            }
+            for (vi, v) in cb.variables.iter().enumerate() {
+                let noff = intern(&mut out, &mut vpool, &v.name);
+                patch_u32(&mut out, name_pos[vi], noff);
+                let toff = place_type(&mut out, &mut vpool, &mut placed_types, &v.var_type, is_sm5);
+                patch_u32(&mut out, type_pos[vi], toff);
+                if v.default_value.is_empty() {
+                    patch_u32(&mut out, def_pos[vi], 0);
+                } else {
+                    let doff = out.len() as u32;
                     out.extend_from_slice(&v.default_value);
+                    patch_u32(&mut out, def_pos[vi], doff);
                 }
             }
         }
 
-        // Write string table
-        out.extend_from_slice(&st.finish());
+        // Creator string, last.
+        let coff = intern(&mut out, &mut vpool, &self.creator);
+        patch_u32(&mut out, creator_pos, coff);
 
+        // Pad the whole chunk to a 4-byte boundary.
+        pad4(&mut out);
         out
     }
 }
