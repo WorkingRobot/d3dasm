@@ -661,6 +661,80 @@ fn intern(out: &mut Vec<u8>, pool: &mut alloc::collections::BTreeMap<alloc::stri
     off
 }
 
+/// `D3D_SHADER_VARIABLE_TYPE` → HLSL scalar base-type name.
+fn base_type_name(t: u16) -> Option<&'static str> {
+    Some(match t {
+        1 => "bool",
+        2 => "int",
+        3 => "float",
+        19 => "uint",
+        39 => "double",
+        _ => return None,
+    })
+}
+
+/// HLSL scalar base-type name → `D3D_SHADER_VARIABLE_TYPE`.
+fn base_type_from(s: &str) -> Option<u16> {
+    Some(match s {
+        "bool" => 1,
+        "int" => 2,
+        "float" => 3,
+        "uint" => 19,
+        "double" => 39,
+        _ => return None,
+    })
+}
+
+/// Canonical HLSL type spelling for a [`TypeDesc`] (without any `row_major`
+/// qualifier or array suffix handling beyond `[N]`). Returns `None` for types
+/// outside the standard scalar/vector/matrix/struct families so the caller can
+/// fall back to the explicit numeric form.
+pub fn hlsl_type_name(td: &TypeDesc<'_>) -> Option<alloc::string::String> {
+    use alloc::string::String;
+    // Struct / object types are named directly.
+    if !td.members.is_empty() || td.class == 5 {
+        if td.name.is_empty() {
+            return None;
+        }
+        return Some(String::from(td.name.as_ref()));
+    }
+    let base = base_type_name(td.var_type)?;
+    let core = match td.class {
+        0 => String::from(base),                              // scalar
+        1 => alloc::format!("{base}{}", td.columns),          // vector
+        2 | 3 => alloc::format!("{base}{}x{}", td.rows, td.columns), // matrix
+        _ => return None,
+    };
+    Some(if td.elements > 0 {
+        alloc::format!("{core}[{}]", td.elements)
+    } else {
+        core
+    })
+}
+
+/// Parse a canonical HLSL type spelling into `(class, base, rows, cols,
+/// elements)`. Matrices default to column-major (`class = 3`); a `row_major`
+/// qualifier is handled by the caller. Returns `None` for unrecognised spellings.
+pub fn parse_hlsl_type(s: &str) -> Option<(u16, u16, u16, u16, u16)> {
+    // Optional [N] array suffix.
+    let (core, elements) = match s.split_once('[') {
+        Some((c, rest)) => (c, rest.strip_suffix(']')?.parse().ok()?),
+        None => (s, 0u16),
+    };
+    // Split leading alphabetic base from the trailing dimension digits.
+    let split = core.find(|c: char| c.is_ascii_digit()).unwrap_or(core.len());
+    let base = base_type_from(&core[..split])?;
+    let dims = &core[split..];
+    let (class, rows, cols) = if dims.is_empty() {
+        (0u16, 1u16, 1u16) // scalar
+    } else if let Some((r, c)) = dims.split_once('x') {
+        (3u16, r.parse().ok()?, c.parse().ok()?) // matrix (column-major default)
+    } else {
+        (1u16, 1u16, dims.parse().ok()?) // vector
+    };
+    Some((class, base, rows, cols, elements))
+}
+
 /// Resolve a variable's type to a descriptor offset, reproducing fxc's sharing:
 /// non-array types (`elements == 0`) are de-duplicated by value; array types
 /// always get a fresh descriptor. Returns the assigned offset, placing the

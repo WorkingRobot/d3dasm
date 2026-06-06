@@ -84,6 +84,16 @@ fn encode_to_text(fourcc: [u8; 4], data: &[u8]) -> Option<String> {
     }
     if &fourcc == b"RDEF" {
         let rd = dxbc::chunks::rdef::parse_rdef(data)?;
+        // Prefer the HLSL reconstruction when it round-trips byte-exactly;
+        // otherwise the explicit key=value form (also lossless).
+        if let Some(hlsl) = dxbc::chunks::rdef_hlsl::rdef_to_hlsl(&rd)
+            && let Some(rd2) = dxbc::chunks::rdef_hlsl::rdef_from_hlsl(&hlsl)
+        {
+            use dxbc::chunks::ChunkWriter;
+            if rd2.to_writable().data == data {
+                return Some(hlsl);
+            }
+        }
         return dxbc::chunks::rdef::rdef_to_text(&rd);
     }
     None
@@ -108,8 +118,18 @@ fn body_to_chunk(fourcc: [u8; 4], body: &str) -> Result<Vec<u8>, AsmError> {
     }
     if &fourcc == b"RDEF" {
         use dxbc::chunks::ChunkWriter;
-        let rd =
-            dxbc::chunks::rdef::rdef_from_text(body).ok_or_else(|| err("malformed rdef text"))?;
+        // Auto-detect: the HLSL form opens with `target`, key=value with `version`.
+        let is_hlsl = body
+            .lines()
+            .map(str::trim)
+            .find(|l| !l.is_empty())
+            .is_some_and(|l| l.starts_with("target"));
+        let rd = if is_hlsl {
+            dxbc::chunks::rdef_hlsl::rdef_from_hlsl(body)
+                .ok_or_else(|| err("malformed rdef hlsl"))?
+        } else {
+            dxbc::chunks::rdef::rdef_from_text(body).ok_or_else(|| err("malformed rdef text"))?
+        };
         return Ok(rd.to_writable().data);
     }
     Err(err("no text codec for chunk"))
