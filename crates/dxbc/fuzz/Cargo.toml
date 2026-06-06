@@ -1,0 +1,26 @@
+[package]
+name = "dxbc-fuzz"
+version = "0.0.0"
+publish = false
+edition = "2024"
+
+[package.metadata]
+cargo-fuzz = true
+
+[dependencies]
+libfuzzer-sys = "0.4"
+arbitrary = "1"
+smallvec = { version = "1", features = ["union"] }
+
+[dependencies.dxbc]
+path = ".."
+
+[[bin]]
+name = "roundtrip"
+path = "fuzz_targets/roundtrip.rs"
+test = false
+doc = false
+bench = false
+
+# Keep the fuzz crate out of the parent workspace (cargo-fuzz convention).
+[workspace]

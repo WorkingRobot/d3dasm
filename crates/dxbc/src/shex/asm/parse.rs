@@ -757,14 +757,13 @@ fn parse_register_prefix(c: &mut Cursor) -> Result<RegisterType, AsmError> {
         }
         return Ok(RegisterType::Unknown(parse_dec(digits)?));
     }
-    // Longest-prefix match against known register prefixes.
+    // Longest-prefix match against known register prefixes. Immediate prefixes
+    // (`l`/`d`) are included so an indexed immediate like `l0` parses; the
+    // `l(...)` / `d(...)` value forms are handled by the caller before this.
     let rest = c.rest();
     let mut best: Option<(RegisterType, usize)> = None;
     for v in 0..=40u32 {
         let rt = RegisterType::from_u32(v);
-        if matches!(rt, RegisterType::Immediate32 | RegisterType::Immediate64) {
-            continue;
-        }
         let p = rt.prefix();
         if rest.starts_with(p) && best.map(|(_, l)| p.len() > l).unwrap_or(true) {
             best = Some((rt, p.len()));

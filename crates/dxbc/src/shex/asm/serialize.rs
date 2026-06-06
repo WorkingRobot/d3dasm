@@ -166,9 +166,14 @@ fn write_operand(w: &mut String, op: &Operand, imm_type: ImmediateType) {
         w.push('|');
     }
     match op.reg_type {
-        RegisterType::Immediate32 => write_immediates(w, 'l', &op.immediate_values, imm_type),
+        // Inline immediates `l(...)` / `d(...)` only when un-indexed. An
+        // immediate that carries indices (a degenerate but decodable state) is
+        // emitted register-style (prefix + indices) by the `_` arm below.
+        RegisterType::Immediate32 if op.indices.is_empty() => {
+            write_immediates(w, 'l', &op.immediate_values, imm_type)
+        }
         // 64-bit immediates stay as raw dword hex (no f64 prettifying).
-        RegisterType::Immediate64 => {
+        RegisterType::Immediate64 if op.indices.is_empty() => {
             write_immediates(w, 'd', &op.immediate_values, ImmediateType::Uint)
         }
         RegisterType::Unknown(v) => {

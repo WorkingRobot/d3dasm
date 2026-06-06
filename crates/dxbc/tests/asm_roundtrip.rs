@@ -1,98 +1,16 @@
-//! Round-trip tests for the `.d3dasm` text format.
+//! Targeted round-trip tests for the lossless `.d3dasm` text format.
 //!
-//! Strategy: construct IR, encode to canonical bytes, then assert that
-//! `encode(parse(serialize(decode(bytes)))) == bytes`. This exercises the real
-//! byte-identity property and sidesteps the lack of `PartialEq` on `Program`
-//! (and the garbage modifier fields `decode` may populate on declarations).
+//! Each case constructs IR, encodes to canonical bytes, then asserts that
+//! `assemble(serialize(decode(bytes)))` reproduces both the IR and the bytes.
 
-use alloc::vec;
-use alloc::vec::Vec;
+mod common;
 
+use common::*;
+use dxbc::shex::{
+    ComponentSelect, CustomDataType, InstructionKind, Opcode, Operand, OperandIndex, Program,
+    RegisterType, ReturnType, assemble, decode, encode, serialize,
+};
 use smallvec::{SmallVec, smallvec};
-
-use super::{parse, serialize};
-use crate::shex::decode::decode;
-use crate::shex::encode::encode;
-use crate::shex::ir::*;
-use crate::shex::opcodes::Opcode;
-
-fn insn(opcode: Opcode, kind: InstructionKind) -> Instruction {
-    Instruction {
-        opcode,
-        saturate: false,
-        test_nonzero: false,
-        precise_mask: 0,
-        resinfo_return_type: None,
-        sync_flags: 0,
-        tex_offsets: None,
-        resource_dim: None,
-        resource_return_type: None,
-        kind,
-    }
-}
-
-fn program(instructions: Vec<Instruction>) -> Program {
-    Program {
-        shader_type: "ps",
-        major_version: 5,
-        minor_version: 0,
-        instructions,
-        warnings: Vec::new(),
-        fourcc: *b"SHEX",
-    }
-}
-
-/// Assert the full round-trip through the text format: both IR-equality
-/// (`parse(serialize(canon)) == canon`) and byte-identity against the original
-/// encoded bytes. `canon` is the decoded IR, which is the clean reference.
-fn rt(p: &Program) {
-    let bytes = encode(p);
-    let canon = decode(&bytes).expect("decode failed");
-    let text = serialize(&canon);
-    let parsed = parse(&text).unwrap_or_else(|e| panic!("parse error: {e}\n--- text ---\n{text}"));
-    assert_eq!(
-        canon, parsed,
-        "IR round-trip mismatch\n--- text ---\n{text}"
-    );
-    assert_eq!(
-        encode(&canon),
-        encode(&parsed),
-        "byte round-trip mismatch\n--- text ---\n{text}"
-    );
-}
-
-// Operand builders.
-
-fn temp(reg: u32, comp: ComponentSelect) -> Operand {
-    reg_op(
-        RegisterType::Temp,
-        comp,
-        smallvec![OperandIndex::Imm32(reg)],
-    )
-}
-
-fn reg_op(reg_type: RegisterType, components: ComponentSelect, indices: Indices) -> Operand {
-    Operand {
-        reg_type,
-        components,
-        negate: false,
-        abs: false,
-        indices,
-        immediate_values: SmallVec::new(),
-    }
-}
-
-const XYZW: ComponentSelect = ComponentSelect::Swizzle([0, 1, 2, 3]);
-const MASK_ALL: ComponentSelect = ComponentSelect::Mask(0xF);
-
-fn generic(opcode: Opcode, operands: Vec<Operand>) -> Instruction {
-    insn(
-        opcode,
-        InstructionKind::Generic {
-            operands: operands.into_iter().collect(),
-        },
-    )
-}
 
 #[test]
 fn ret_only() {
@@ -187,7 +105,7 @@ fn relative_index_operand() {
         XYZW,
         smallvec![
             OperandIndex::Imm32(0),
-            OperandIndex::RelativePlusImm(2, alloc::boxed::Box::new(inner))
+            OperandIndex::RelativePlusImm(2, Box::new(inner))
         ],
     );
     rt(&program(vec![
@@ -375,15 +293,14 @@ fn shdr_fourcc_preserved() {
     };
     let text = serialize(&p);
     assert!(text.starts_with("vs_4_0 SHDR\n"), "text:\n{text}");
-    let p2 = parse(&text).expect("parse failed");
+    let p2 = assemble(&text).expect("parse failed");
     assert_eq!(p2, p, "SHDR round-trip mismatch\n{text}");
 }
 
 #[test]
 fn declarations_have_no_garbage_modifiers() {
     // A texture3d resource sets token0 bit 13 (part of the dimension field);
-    // decode must NOT surface that as `saturate`. Verifies the modifier-gating
-    // fix keeps declaration IR clean.
+    // decode must NOT surface that as `saturate`.
     let t = reg_op(
         RegisterType::Resource,
         ComponentSelect::Swizzle([0, 1, 2, 3]),
@@ -403,10 +320,7 @@ fn declarations_have_no_garbage_modifiers() {
         !canon.instructions[0].saturate,
         "decode leaked garbage saturate"
     );
-    assert_eq!(
-        canon.instructions[0].precise_mask, 0,
-        "garbage precise_mask"
-    );
+    assert_eq!(canon.instructions[0].precise_mask, 0, "garbage precise_mask");
     rt(&prog);
 }
 
@@ -435,11 +349,11 @@ fn comments_are_ignored() {
     ]);
     let canon = decode(&encode(&p)).unwrap();
     let text = serialize(&canon);
-    let commented = alloc::format!(
+    let commented = format!(
         "// a header comment\n{}\n// a dangling comment",
         text.replace("\nret", "  // trailing comment\nret")
     );
-    let parsed = parse(&commented).expect("parse with comments");
+    let parsed = assemble(&commented).expect("parse with comments");
     assert_eq!(
         encode(&canon),
         encode(&parsed),
@@ -456,11 +370,7 @@ fn resource_extended_tokens() {
         vec![
             temp(0, MASK_ALL),
             temp(1, XYZW),
-            reg_op(
-                RegisterType::Resource,
-                XYZW,
-                smallvec![OperandIndex::Imm32(0)],
-            ),
+            reg_op(RegisterType::Resource, XYZW, smallvec![OperandIndex::Imm32(0)]),
             reg_op(
                 RegisterType::Sampler,
                 ComponentSelect::ZeroComponent,
@@ -471,11 +381,7 @@ fn resource_extended_tokens() {
     // type 2, dim=texture2d(3), stride=0 ; type 3, four floats(5)
     i.resource_dim = Some(2 | (3 << 6));
     i.resource_return_type = Some(3 | (5 << 6) | (5 << 10) | (5 << 14) | (5 << 18));
-    let canon = decode(&encode(&program(vec![
-        i.clone(),
-        generic(Opcode::Ret, vec![]),
-    ])))
-    .unwrap();
+    let canon = decode(&encode(&program(vec![i.clone(), generic(Opcode::Ret, vec![])]))).unwrap();
     let text = serialize(&canon);
     assert!(
         text.contains("_res(texture2d)"),
@@ -490,7 +396,6 @@ fn resource_extended_tokens() {
 
 #[test]
 fn unknown_opcode_roundtrip() {
-    // An opcode outside the known 0..=217 range must round-trip its raw value.
     rt(&program(vec![
         generic(Opcode::Unknown(253), vec![temp(0, MASK_ALL), temp(1, XYZW)]),
         generic(Opcode::Ret, vec![]),
@@ -499,7 +404,6 @@ fn unknown_opcode_roundtrip() {
 
 #[test]
 fn unknown_register_roundtrip() {
-    // An unrecognized register file (type > 40) must round-trip its raw value.
     let r = reg_op(
         RegisterType::Unknown(45),
         XYZW,

@@ -159,6 +159,3 @@ pub(crate) fn name_of(table: &[(&'static str, u32)], val: u32) -> Option<&'stati
 pub(crate) fn value_of(table: &[(&'static str, u32)], name: &str) -> Option<u32> {
     table.iter().find(|(n, _)| *n == name).map(|(_, v)| *v)
 }
-
-#[cfg(test)]
-mod tests;

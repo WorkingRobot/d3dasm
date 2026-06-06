@@ -3,6 +3,11 @@
 
 # Proprietary shader data
 /shaders
+/shaders-pc
+
+# Generated disassembly output
+/terrain_d3dasm
+*.d3dasm
 
 # macOS
 .DS_Store
