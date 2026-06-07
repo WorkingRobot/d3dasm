@@ -75,6 +75,20 @@ pub fn write_mnemonic(w: &mut dyn Write, instr: &Instruction) -> core::fmt::Resu
         Some(2) => w.write_str("_uint")?,
         _ => {}
     }
+    // Conditional test suffix (`if_z`/`if_nz`, `breakc_z`/`breakc_nz`, …). This
+    // changes the branch semantics — `_z` takes the branch on zero, `_nz` on
+    // non-zero — so it must always be shown for the conditional opcodes.
+    if matches!(
+        instr.opcode,
+        Opcode::If
+            | Opcode::Breakc
+            | Opcode::Callc
+            | Opcode::Continuec
+            | Opcode::Discard
+            | Opcode::Retc
+    ) {
+        w.write_str(if instr.test_nonzero { "_nz" } else { "_z" })?;
+    }
     if instr.saturate {
         w.write_str("_sat")?;
     }
@@ -83,7 +97,48 @@ pub fn write_mnemonic(w: &mut dyn Write, instr: &Instruction) -> core::fmt::Resu
     {
         write!(w, "({u}, {v}, {ww})")?;
     }
+    // Resource extended tokens on sample/ld/resinfo: fxc renders these as
+    // `_indexable(<dim>[, stride=N])(<rt>,<rt>,<rt>,<rt>)`.
+    if let Some(rd) = instr.resource_dim {
+        let dim = (rd >> 6) & 0x1F;
+        let stride = (rd >> 11) & 0xF_FFFF;
+        write!(w, "_indexable({}", resource_dim_name(dim))?;
+        if matches!(dim, 11 | 12) {
+            write!(w, ", stride={stride}")?;
+        }
+        w.write_str(")")?;
+    }
+    if let Some(rr) = instr.resource_return_type {
+        write!(
+            w,
+            "({},{},{},{})",
+            ReturnType::from_u32((rr >> 6) & 0xF).name(),
+            ReturnType::from_u32((rr >> 10) & 0xF).name(),
+            ReturnType::from_u32((rr >> 14) & 0xF).name(),
+            ReturnType::from_u32((rr >> 18) & 0xF).name(),
+        )?;
+    }
     Ok(())
+}
+
+/// SB resource-dimension name (`D3D10_SB_RESOURCE_DIMENSION`), as used in the
+/// resource extended token on sample/ld/resinfo.
+fn resource_dim_name(dim: u32) -> &'static str {
+    match dim {
+        1 => "buffer",
+        2 => "texture1d",
+        3 => "texture2d",
+        4 => "texture2dms",
+        5 => "texture3d",
+        6 => "texturecube",
+        7 => "texture1darray",
+        8 => "texture2darray",
+        9 => "texture2dmsarray",
+        10 => "texturecubearray",
+        11 => "raw_buffer",
+        12 => "structured_buffer",
+        _ => "unknown",
+    }
 }
 
 /// Write a single [`Operand`] into `w` (float immediate formatting).

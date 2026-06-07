@@ -277,9 +277,23 @@ mod tests {
             &[instr_token(62, 1)],                   // ret
         ]);
         let output = disassemble(&data);
-        assert!(output.contains("if"), "missing 'if' in: {output}");
+        // The conditional test suffix must be shown (fxc-compatible): bit 18
+        // clear ⇒ `if_z` (branch on zero), distinct from `if_nz`.
+        assert!(output.contains("if_z "), "missing 'if_z' in: {output}");
         assert!(output.contains("else"), "missing 'else' in: {output}");
         assert!(output.contains("endif"), "missing 'endif' in: {output}");
+
+        // bit 18 set ⇒ `if_nz` (branch on non-zero).
+        let nz = build_ps(&[
+            &[instr_token(31, 3) | (1 << 18), cond[0], cond[1]],
+            &[instr_token(21, 1)],
+            &[instr_token(62, 1)],
+        ]);
+        assert!(
+            disassemble(&nz).contains("if_nz "),
+            "missing 'if_nz' in: {}",
+            disassemble(&nz)
+        );
     }
 
     #[test]
