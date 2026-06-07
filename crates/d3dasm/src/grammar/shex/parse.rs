@@ -680,16 +680,15 @@ fn parse_raw_block(c: &mut Cursor) -> Result<Vec<u32>, AsmError> {
 // ---------------------------------------------------------------------------
 
 fn parse_operand_list(c: &mut Cursor) -> Result<Operands, AsmError> {
+    // Operands are whitespace-separated and each is a single whitespace-free
+    // token (immediates use `,` internally, relative indices use `+`).
     let mut operands: Operands = SmallVec::new();
-    c.skip_spaces();
-    if c.eof() {
-        return Ok(operands);
-    }
     loop {
-        operands.push(parse_operand(c)?);
-        if !c.eat_str(", ") {
+        c.skip_spaces();
+        if c.eof() {
             break;
         }
+        operands.push(parse_operand(c)?);
     }
     Ok(operands)
 }
@@ -752,7 +751,7 @@ fn parse_imm_list(c: &mut Cursor) -> Result<Immediates, AsmError> {
         imms.push(parse_immediate_token(
             c.take_while(|b| b != b',' && b != b')'),
         )?);
-        if c.eat_str(", ") {
+        if c.eat_byte(b',') {
             continue;
         }
         if c.eat_byte(b')') {
@@ -842,9 +841,9 @@ fn parse_bracket_index(c: &mut Cursor) -> Result<OperandIndex, AsmError> {
     if c.peek().map(|b| b.is_ascii_digit()).unwrap_or(false) {
         return parse_number_index(c);
     }
-    // Relative: a nested operand, optionally followed by " + imm".
+    // Relative: a nested operand, optionally followed by "+imm".
     let sub = parse_operand(c)?;
-    if c.eat_str(" + ") {
+    if c.eat_byte(b'+') {
         let imm = parse_dec(c.take_while(|b| b != b']'))?;
         Ok(OperandIndex::RelativePlusImm(imm, Box::new(sub)))
     } else {

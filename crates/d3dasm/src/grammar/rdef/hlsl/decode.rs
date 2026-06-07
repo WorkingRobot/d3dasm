@@ -10,7 +10,11 @@ use dxbc::chunks::rdef::{
     CBufferDef, CBufferVariable, MemberDesc, ResourceBinding, ResourceDef, SLOT_UNUSED, SVF_USED,
     TypeDesc,
 };
-use dxbc::shex::Program;
+
+/// Parse a `0x`-prefixed (or bare) hex u32.
+fn parse_hex0x(s: &str) -> Option<u32> {
+    u32::from_str_radix(s.strip_prefix("0x").unwrap_or(s), 16).ok()
+}
 
 /// Collect `key=value` tokens (ignoring bare words) from an iterator.
 fn kv<'a>(it: impl Iterator<Item = &'a str>) -> BTreeMap<&'a str, &'a str> {
@@ -205,17 +209,19 @@ struct VarTail {
 fn parse_var_tail<'a>(toks: impl Iterator<Item = &'a str> + Clone) -> Option<VarTail> {
     let toks: Vec<&str> = toks.collect();
     let m = kv(toks.iter().copied());
-    let mut flags: Option<u32> = None;
-    for t in &toks {
-        if *t == "used" {
-            flags = Some(SVF_USED);
-        } else if *t == "unused" {
-            flags = Some(0);
-        }
-    }
-    if let Some(v) = m.get("vflags") {
-        flags = Some(u32::from_str_radix(v, 16).ok()?);
-    }
+    // `used=true|false` (always emitted) plus any other variable-flag bits in
+    // `var_flags=`. RDEF now parses without the SHEX program.
+    let extra = match m.get("var_flags") {
+        Some(v) => u32::from_str_radix(v, 16).ok()?,
+        None => 0,
+    };
+    let flags: Option<u32> = match m.get("used") {
+        Some(&"true") => Some(SVF_USED | extra),
+        Some(&"false") => Some(extra),
+        Some(_) => return None,
+        None if extra != 0 => Some(extra),
+        None => None,
+    };
     let default_init = toks
         .iter()
         .position(|t| *t == "=")
@@ -252,7 +258,7 @@ fn parse_var_tail<'a>(toks: impl Iterator<Item = &'a str> + Clone) -> Option<Var
 }
 
 /// Parse HLSL text produced by [`rdef_to_hlsl`] back into an owned RDEF.
-pub fn rdef_from_hlsl(text: &str, program: Option<&Program>) -> Option<ResourceDef<'static>> {
+pub fn rdef_from_hlsl(text: &str) -> Option<ResourceDef<'static>> {
     let mut rd = ResourceDef {
         constant_buffers: Vec::new(),
         bindings: Vec::new(),
@@ -401,7 +407,7 @@ pub fn rdef_from_hlsl(text: &str, program: Option<&Program>) -> Option<ResourceD
                         name: Cow::Owned(String::from(vname)),
                         offset,
                         size,
-                        flags: tail.flags.unwrap_or(DERIVE_USED),
+                        flags: tail.flags.unwrap_or(0),
                         var_type: vt,
                         default_value: Cow::Owned(default),
                         texture_start: tail.tex.map(|t| t.0).or(if sm5 {
@@ -422,25 +428,35 @@ pub fn rdef_from_hlsl(text: &str, program: Option<&Program>) -> Option<ResourceD
             continue;
         }
 
-        // Top-level directives.
+        // Header tags (`key=value`).
+        if let Some(v) = line.strip_prefix("target=") {
+            rd.target_version = parse_hex0x(v.trim())?;
+            sm5 = is_sm5(rd.target_version);
+            continue;
+        }
+        if let Some(v) = line.strip_prefix("flags=") {
+            rd.compile_flags = parse_hex0x(v.trim())?;
+            continue;
+        }
+        if let Some(v) = line.strip_prefix("creator=") {
+            rd.creator = Cow::Owned(String::from(v));
+            continue;
+        }
+        if let Some(v) = line.strip_prefix("rd11=") {
+            let mut a = [0u32; 8];
+            let mut it = v.split(',');
+            for slot in &mut a {
+                *slot = u32::from_str_radix(it.next()?.trim(), 16).ok()?;
+            }
+            rd.rd11_extra = Some(a);
+            continue;
+        }
+
+        // Other top-level directives.
         let (head, rest) = line.split_once(' ').unwrap_or((line, ""));
         match head {
-            "target" => {
-                rd.target_version = u32::from_str_radix(rest.trim(), 16).ok()?;
-                sm5 = is_sm5(rd.target_version);
-            }
-            "flags" => rd.compile_flags = u32::from_str_radix(rest.trim(), 16).ok()?,
             "cborder" => {
                 cb_order = Some(rest.split_whitespace().map(String::from).collect());
-            }
-            "creator" => rd.creator = Cow::Owned(String::from(rest)),
-            "rd11" => {
-                let mut a = [0u32; 8];
-                let mut it = rest.split_whitespace();
-                for slot in &mut a {
-                    *slot = u32::from_str_radix(it.next()?, 16).ok()?;
-                }
-                rd.rd11_extra = Some(a);
             }
             "struct" => {
                 // `struct Name [class=..] [vtype=..] [rows=..] [cols=..] [sm5=..] {`
@@ -605,27 +621,5 @@ pub fn rdef_from_hlsl(text: &str, program: Option<&Program>) -> Option<ResourceD
         rd.bindings[i].num_samples = s;
     }
 
-    // Resolve cbuffer variables left as "derive" by computing the used bit from
-    // the program (or 0 when no program is available).
-    let reads = program.map(cbuffer_reads);
-    let regmap: BTreeMap<String, u32> = rd
-        .bindings
-        .iter()
-        .filter(|b| b.input_type == 0)
-        .map(|b| (String::from(b.name.as_ref()), b.bind_point))
-        .collect();
-    for cb in &mut rd.constant_buffers {
-        let cbr = regmap
-            .get(cb.name.as_ref())
-            .and_then(|r| reads.as_ref().and_then(|m| m.get(r)));
-        for v in &mut cb.variables {
-            if v.flags == DERIVE_USED {
-                v.flags = match cbr {
-                    Some(r) if var_used(r, v.offset, v.size) => SVF_USED,
-                    _ => 0,
-                };
-            }
-        }
-    }
     Some(rd)
 }

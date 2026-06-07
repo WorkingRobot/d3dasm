@@ -51,13 +51,13 @@ pub fn rdef_to_text(rd: &ResourceDef<'_>) -> Option<String> {
     }
 
     let mut o = String::new();
-    let _ = writeln!(o, "version {:08x}", rd.target_version);
-    let _ = writeln!(o, "flags {:x}", rd.compile_flags);
-    let _ = writeln!(o, "creator {}", rd.creator);
+    let _ = writeln!(o, "version=0x{:08x}", rd.target_version);
+    let _ = writeln!(o, "flags=0x{:x}", rd.compile_flags);
+    let _ = writeln!(o, "creator={}", rd.creator);
     if let Some(rd11) = &rd.rd11_extra {
-        let _ = write!(o, "rd11");
-        for x in rd11 {
-            let _ = write!(o, " {x:x}");
+        let _ = write!(o, "rd11=");
+        for (i, x) in rd11.iter().enumerate() {
+            let _ = write!(o, "{}{x:x}", if i == 0 { "" } else { "," });
         }
         let _ = writeln!(o);
     }
@@ -186,19 +186,32 @@ pub fn rdef_from_text(text: &str) -> Option<ResourceDef<'static>> {
         if line.is_empty() {
             continue;
         }
+        // Header tags (`key=value`).
+        let hex0x = |s: &str| u32::from_str_radix(s.trim().strip_prefix("0x").unwrap_or(s.trim()), 16);
+        if let Some(v) = line.strip_prefix("version=") {
+            rd.target_version = hex0x(v).ok()?;
+            continue;
+        }
+        if let Some(v) = line.strip_prefix("flags=") {
+            rd.compile_flags = hex0x(v).ok()?;
+            continue;
+        }
+        if let Some(v) = line.strip_prefix("creator=") {
+            rd.creator = Cow::Owned(String::from(v));
+            continue;
+        }
+        if let Some(v) = line.strip_prefix("rd11=") {
+            let mut a = [0u32; 8];
+            let mut it = v.split(',');
+            for slot in &mut a {
+                *slot = u32::from_str_radix(it.next()?.trim(), 16).ok()?;
+            }
+            rd.rd11_extra = Some(a);
+            continue;
+        }
+
         let (head, rest) = line.split_once(' ').unwrap_or((line, ""));
         match head {
-            "version" => rd.target_version = u32::from_str_radix(rest.trim(), 16).ok()?,
-            "flags" => rd.compile_flags = u32::from_str_radix(rest.trim(), 16).ok()?,
-            "creator" => rd.creator = Cow::Owned(String::from(rest)),
-            "rd11" => {
-                let mut a = [0u32; 8];
-                let mut it = rest.split_whitespace();
-                for slot in &mut a {
-                    *slot = u32::from_str_radix(it.next()?, 16).ok()?;
-                }
-                rd.rd11_extra = Some(a);
-            }
             "binding" => {
                 let mut f = rest.split_whitespace();
                 let name = f.next()?;

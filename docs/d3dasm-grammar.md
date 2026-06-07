@@ -23,13 +23,17 @@ intended, consistent rule.
 > are what the current code does. A future parser should follow **Observed**
 > for compatibility and may additionally accept the **Recommended** relaxations.
 >
-> **Note (grammar in flux).** Several sections — STAT (§8), signatures (§7), and
-> the SHEX declaration tags / profile line (§9) — have been moved to a uniform
-> `key=value` tag form and a `profile=` header (resolving parts of §12.1/§12.9).
-> The worked example in §10 shows the current output. RDEF (§5–6) and the
-> operand list still use the forms documented below; see
-> [`d3dasm-desired-grammar.md`](d3dasm-desired-grammar.md) for the remaining
-> target changes.
+> **Note (migrated to the new grammar).** The implementation has been migrated
+> to the consistent grammar described in
+> [`d3dasm-desired-grammar.md`](d3dasm-desired-grammar.md): uniform `key=value`
+> tags everywhere (`profile=`, `access=`, `dim=`/`rt=`, `samples=`, …),
+> whitespace-separated operands with `,`-only list values, `.xyzw`/`none`
+> component masks, a self-contained RDEF (`used=true|false` always emitted, no
+> dependence on the SHEX program), `key=value` RDEF headers (`target=`/
+> `version=`), and a `.code RDEF form=hlsl|kv` marker. The **worked example in
+> §10 is current**; many of the per-section *Observed* forms below predate the
+> migration — treat the desired-grammar doc as the authoritative spec and §10 as
+> the ground truth, pending a full rewrite of §§4–9 here.
 
 ## Source of truth
 
@@ -618,16 +622,16 @@ The opening of a pixel-shader container (abridged), showing the layering:
 ```
 // ===== forensic header (informational, ignored on parse) =====
 .dxbc version=1
-.code RDEF
-target ffff0500
-flags 100
-creator Microsoft (R) HLSL Shader Compiler 10.0.10011.0
-rd11 31314452 3c 18 20 28 24 c 0
+.code RDEF form=hlsl
+target=0xffff0500
+flags=0x100
+creator=Microsoft (R) HLSL Shader Compiler 10.0.10011.0
+rd11=31314452,3c,18,20,28,24,c,0
 SamplerState gDirShadowMapSampler : register(s1);
 Texture2DArray<float4> gDirShadowMapTexture : register(t0);
 cbuffer cbShared : register(b0) flags=userPacked {
-    float4x4 gWorldToProj : packoffset(c0);
-    bool gDirLightEnabled : packoffset(c4);
+    float4x4 gWorldToProj : packoffset(c0) used=false;
+    bool gDirLightEnabled : packoffset(c4) used=false;
 };
 .code ISGN
 SV_Position idx=0 reg=0 type=float mask=.xyzw rw=none sv=position
@@ -636,7 +640,8 @@ profile=ps_5_0
 dcl_globalFlags refactoringAllowed
 dcl_constantbuffer cb0[32].xyzw access=dynamicIndexed
 dcl_resource t0 dim=texture2darray rt=float,float,float,float samples=0
-sample_res(texture2darray)_rt(float,float,float,float) r6:z, r7.zxwz, t0.yzxw, s1
+mad_sat r0:y r4.z cb0[r0.y+11].x cb0[r0.y+11].y
+sample_res(texture2darray)_rt(float,float,float,float) r6:z r7.zxwz t0.yzxw s1
 ret
 .code STAT
 size=148
@@ -644,6 +649,10 @@ sample_frequency=false
 instructions=191
 .end
 ```
+
+Note the operand forms: write-mask `r6:z`, read-swizzle `r7.zxwz`, vector
+immediate `l(a,b,c,d)` (comma, no space), and relative index `cb0[r0.y+11]`
+(`+`, no space) — operands are whitespace-separated tokens, list values use `,`.
 
 Note `r6:z` (write-mask `z`) vs `r7.zxwz` (read swizzle) vs `t0.yzxw` (resource
 component order) on the `sample` line — see [§9.6](#96-components-and-indices).

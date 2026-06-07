@@ -10,7 +10,6 @@
 //! particular RDEF can't be reproduced exactly here it falls back to the
 //! explicit `key=value` form in [`super::rdef`].
 
-use alloc::collections::{BTreeMap, BTreeSet};
 use alloc::string::String;
 use alloc::vec::Vec;
 use core::fmt::Write as _;
@@ -20,98 +19,6 @@ use dxbc::chunks::rdef::{
     SIF_TEXTURE_COMPONENT_0, SIF_TEXTURE_COMPONENT_1, SIF_UNUSED, SIF_USER_PACKED, TypeDesc,
     hlsl_type_name, parse_hlsl_type,
 };
-use dxbc::shex::{ComponentSelect, Operand, OperandIndex, Program, RegisterType};
-
-// ---------------------------------------------------------------------------
-// Constant-buffer usage analysis (derives the `used` flag from the program)
-// ---------------------------------------------------------------------------
-
-/// Sentinel `flags` meaning "no explicit tag — derive the used bit".
-const DERIVE_USED: u32 = 0xFFFF_FFFF;
-
-/// Which bytes of one constant buffer the shader program reads.
-#[derive(Default)]
-struct CbReads {
-    /// Statically-addressed bytes.
-    bytes: BTreeSet<u32>,
-    /// Base byte offsets of dynamically-indexed arrays (`cb[base + r]`).
-    dyn_base: BTreeSet<u32>,
-    /// A fully dynamic index was seen; treat the whole buffer as read.
-    dyn_all: bool,
-}
-
-fn collect_cb_reads(op: &Operand, t: &mut BTreeMap<u32, CbReads>) {
-    for idx in op.indices.iter() {
-        if let OperandIndex::Relative(o) | OperandIndex::RelativePlusImm(_, o) = idx {
-            collect_cb_reads(o, t);
-        }
-    }
-    if op.reg_type != RegisterType::ConstantBuffer {
-        return;
-    }
-    let mut it = op.indices.iter();
-    let (Some(i0), Some(i1)) = (it.next(), it.next()) else {
-        return;
-    };
-    let OperandIndex::Imm32(reg) = i0 else { return };
-    let comps: Vec<u32> = match &op.components {
-        ComponentSelect::Swizzle(s) => {
-            let mut v: Vec<u32> = s.iter().map(|&c| c as u32).collect();
-            v.sort_unstable();
-            v.dedup();
-            v
-        }
-        ComponentSelect::Scalar(c) => alloc::vec![*c as u32],
-        _ => alloc::vec![0, 1, 2, 3],
-    };
-    let e = t.entry(*reg).or_default();
-    match i1 {
-        OperandIndex::Imm32(v) => {
-            let v = *v;
-            for c in &comps {
-                for b in 0..4 {
-                    e.bytes.insert(v * 16 + c * 4 + b);
-                }
-            }
-        }
-        OperandIndex::RelativePlusImm(base, _) => {
-            e.dyn_base.insert(*base * 16);
-        }
-        _ => e.dyn_all = true,
-    }
-}
-
-/// Map constant-buffer register → the bytes the program reads from it.
-fn cbuffer_reads(program: &Program) -> BTreeMap<u32, CbReads> {
-    let mut t = BTreeMap::new();
-    for ins in &program.instructions {
-        for op in ins.operands() {
-            collect_cb_reads(op, &mut t);
-        }
-    }
-    t
-}
-
-/// Whether any byte of `[offset, offset+size)` is read.
-fn var_used(r: &CbReads, offset: u32, size: u32) -> bool {
-    r.dyn_all
-        || r.dyn_base.iter().any(|&b| b >= offset && b < offset + size)
-        || (offset..offset + size).any(|b| r.bytes.contains(&b))
-}
-
-/// Reads for the constant buffer named `cb_name`, if its register is known.
-fn cb_reads_for<'a>(
-    rd: &ResourceDef<'_>,
-    reads: Option<&'a BTreeMap<u32, CbReads>>,
-    cb_name: &str,
-) -> Option<&'a CbReads> {
-    let reg = rd
-        .bindings
-        .iter()
-        .find(|b| b.name == cb_name && b.input_type == 0)?
-        .bind_point;
-    reads?.get(&reg)
-}
 
 // ---------------------------------------------------------------------------
 // Small helpers

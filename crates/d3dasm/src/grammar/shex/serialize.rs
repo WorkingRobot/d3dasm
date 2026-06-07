@@ -44,8 +44,8 @@ fn write_instruction(w: &mut String, instr: &Instruction) -> core::fmt::Result {
             write_mnemonic(w, instr.opcode);
             write_modifiers(w, instr);
             let imm_type = opcode_imm_type(instr.opcode);
-            for (i, op) in operands.iter().enumerate() {
-                w.push_str(if i == 0 { " " } else { ", " });
+            for op in operands.iter() {
+                w.push(' ');
                 write_operand(w, op, imm_type);
             }
             Ok(())
@@ -210,7 +210,7 @@ fn write_immediates(w: &mut String, sigil: char, values: &Immediates, imm_type: 
     w.push('(');
     for (i, v) in values.iter().enumerate() {
         if i > 0 {
-            w.push_str(", ");
+            w.push(',');
         }
         write_immediate_value(w, *v, imm_type);
     }
@@ -273,7 +273,7 @@ fn write_index(w: &mut String, idx: &OperandIndex) {
         OperandIndex::Relative(sub) => write_operand(w, sub, ImmediateType::Uint),
         OperandIndex::RelativePlusImm(imm, sub) => {
             write_operand(w, sub, ImmediateType::Uint);
-            let _ = write!(w, " + {imm}");
+            let _ = write!(w, "+{imm}");
         }
     }
 }

@@ -1,6 +1,5 @@
 //! Emit an RDEF as editable HLSL.
 
-use alloc::collections::BTreeMap;
 use alloc::string::String;
 use core::fmt::Write as _;
 
@@ -9,7 +8,6 @@ use dxbc::chunks::ChunkWriter;
 use dxbc::chunks::rdef::{
     CBufferDef, CBufferVariable, ResourceBinding, ResourceDef, SLOT_UNUSED, SVF_USED,
 };
-use dxbc::shex::Program;
 
 fn emit_binding(o: &mut String, b: &ResourceBinding<'_>, rd: &ResourceDef<'_>) -> Option<()> {
     let (spec, reg) = binding_typespec(b, rd)?;
@@ -46,13 +44,7 @@ fn emit_binding(o: &mut String, b: &ResourceBinding<'_>, rd: &ResourceDef<'_>) -
     Some(())
 }
 
-fn emit_var(
-    o: &mut String,
-    v: &CBufferVariable<'_>,
-    indent: &str,
-    sm5: bool,
-    cb_reads: Option<&CbReads>,
-) -> Option<()> {
+fn emit_var(o: &mut String, v: &CBufferVariable<'_>, indent: &str, sm5: bool) -> Option<()> {
     let t = &v.var_type;
     let tref = type_ref(t)?;
     let (stem, arr) = split_array(&tref);
@@ -70,21 +62,12 @@ fn emit_var(
     if derived_var_size(t) != Some(v.size) {
         let _ = write!(o, " size={}", v.size);
     }
-    // The `used` flag is derived from the program when available; tag the
-    // variable only when the stored flags differ from that derivation.
-    let baseline = match cb_reads {
-        Some(r) if var_used(r, v.offset, v.size) => SVF_USED,
-        Some(_) => 0,
-        None => 0,
-    };
-    if v.flags != baseline {
-        if v.flags == SVF_USED {
-            o.push_str(" used");
-        } else if v.flags == 0 {
-            o.push_str(" unused");
-        } else {
-            let _ = write!(o, " vflags={:x}", v.flags);
-        }
+    // Always emit the `used` bit explicitly so RDEF parses without the SHEX
+    // program. Any other variable-flag bits ride along as `var_flags=`.
+    let _ = write!(o, " used={}", (v.flags & SVF_USED) != 0);
+    let other = v.flags & !SVF_USED;
+    if other != 0 {
+        let _ = write!(o, " var_flags={other:x}");
     }
     if let Some(e) = &t.sm5_extra
         && *e != [0; 4]
@@ -119,18 +102,16 @@ fn emit_var(
 
 /// Serialize an RDEF to editable HLSL. Returns `None` for anything this codec
 /// cannot model losslessly (caller falls back to the `key=value` form).
-pub fn rdef_to_hlsl(rd: &ResourceDef<'_>, program: Option<&Program>) -> Option<String> {
+pub fn rdef_to_hlsl(rd: &ResourceDef<'_>) -> Option<String> {
     let sm5 = is_sm5(rd.target_version);
-    let reads = program.map(cbuffer_reads);
-    let reads = reads.as_ref();
     let mut o = String::new();
-    let _ = writeln!(o, "target {:08x}", rd.target_version);
-    let _ = writeln!(o, "flags {:x}", rd.compile_flags);
-    let _ = writeln!(o, "creator {}", rd.creator);
+    let _ = writeln!(o, "target=0x{:08x}", rd.target_version);
+    let _ = writeln!(o, "flags=0x{:x}", rd.compile_flags);
+    let _ = writeln!(o, "creator={}", rd.creator);
     if let Some(rd11) = &rd.rd11_extra {
-        o.push_str("rd11");
-        for x in rd11 {
-            let _ = write!(o, " {x:x}");
+        o.push_str("rd11=");
+        for (i, x) in rd11.iter().enumerate() {
+            let _ = write!(o, "{}{x:x}", if i == 0 { "" } else { "," });
         }
         o.push('\n');
     }
@@ -210,15 +191,15 @@ pub fn rdef_to_hlsl(rd: &ResourceDef<'_>, program: Option<&Program>) -> Option<S
 
     // Body: prefer merged single-declaration cbuffers; fall back to the
     // two-section form when the array orderings don't allow a faithful merge.
-    if let Some(body) = emit_merged_body(rd, sm5, reads) {
+    if let Some(body) = emit_merged_body(rd, sm5) {
         let full = alloc::format!("{o}{body}");
-        if let Some(rd2) = rdef_from_hlsl(&full, program)
+        if let Some(rd2) = rdef_from_hlsl(&full)
             && rd2.to_writable().data == rd.to_writable().data
         {
             return Some(full);
         }
     }
-    let body = emit_twosection_body(rd, sm5, reads)?;
+    let body = emit_twosection_body(rd, sm5)?;
     Some(alloc::format!("{o}{body}"))
 }
 
@@ -228,7 +209,6 @@ fn emit_cbuffer_block(
     sm5: bool,
     register: Option<u32>,
     bind_flags: u32,
-    cb_reads: Option<&CbReads>,
 ) -> Option<()> {
     let _ = write!(o, "cbuffer {}", cb.name);
     if let Some(slot) = register {
@@ -245,18 +225,14 @@ fn emit_cbuffer_block(
     }
     o.push_str(" {\n");
     for v in &cb.variables {
-        emit_var(o, v, "    ", sm5, cb_reads)?;
+        emit_var(o, v, "    ", sm5)?;
     }
     o.push_str("};\n");
     Some(())
 }
 
 /// Two-section body: every binding as a declaration, then every cbuffer layout.
-fn emit_twosection_body(
-    rd: &ResourceDef<'_>,
-    sm5: bool,
-    reads: Option<&BTreeMap<u32, CbReads>>,
-) -> Option<String> {
+fn emit_twosection_body(rd: &ResourceDef<'_>, sm5: bool) -> Option<String> {
     let mut o = String::new();
     for b in &rd.bindings {
         emit_binding(&mut o, b, rd)?;
@@ -265,8 +241,7 @@ fn emit_twosection_body(
         o.push('\n');
     }
     for cb in &rd.constant_buffers {
-        let cbr = cb_reads_for(rd, reads, cb.name.as_ref());
-        emit_cbuffer_block(&mut o, cb, sm5, None, 0, cbr)?;
+        emit_cbuffer_block(&mut o, cb, sm5, None, 0)?;
     }
     Some(o)
 }
@@ -274,11 +249,7 @@ fn emit_twosection_body(
 /// Merged body: cbuffer bindings become single `cbuffer N : register(bN) {..}`
 /// blocks and resource cbuffer defs are reconstructed from their bindings.
 /// Returns None when binding order can't reproduce the cbuffer-def order.
-fn emit_merged_body(
-    rd: &ResourceDef<'_>,
-    sm5: bool,
-    reads: Option<&BTreeMap<u32, CbReads>>,
-) -> Option<String> {
+fn emit_merged_body(rd: &ResourceDef<'_>, sm5: bool) -> Option<String> {
     // Reconstruction places kind-0 defs (in cbuffer-binding order) first, then
     // resource defs (in structured-binding order); mergeable only when that
     // reproduces the actual cbuffer-def order. Regular cbuffers become
@@ -321,8 +292,7 @@ fn emit_merged_body(
     for b in &rd.bindings {
         if b.input_type == 0 {
             let cb = rd.constant_buffers.iter().find(|c| c.name == b.name)?;
-            let cbr = reads.and_then(|m| m.get(&b.bind_point));
-            emit_cbuffer_block(&mut o, cb, sm5, Some(b.bind_point), b.flags, cbr)?;
+            emit_cbuffer_block(&mut o, cb, sm5, Some(b.bind_point), b.flags)?;
         } else {
             emit_binding(&mut o, b, rd)?;
         }

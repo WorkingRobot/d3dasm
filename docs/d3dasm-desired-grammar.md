@@ -9,15 +9,19 @@ commits to a concrete, consistent resolution.
 The two documents share notation (see `d3dasm-grammar.md` §1) so they can be
 diffed section by section.
 
-> **Status: partially implemented.** Treated as still-`v1` (no compatibility
-> with older `.d3dasm` text is kept; artifacts are regenerated). **Done so far:**
-> uniform `key=value` tags and `profile=`/`fourcc=` in SHEX declarations;
-> always-emit `samples=`; `dim=`/`rt=` resource tags; STAT and signatures in
-> `key=value` form with `.xyzw`/`none` masks; unknown tags are errors. **Still
-> to do:** self-contained RDEF (always-emit `used`, drop the SHEX-program
-> derivation), the RDEF header/`@reg`/`form=` changes, whitespace-separated
-> operands, and the typed `f32(...)` literal. Section references like
-> *(fixes §12.1)* point at the inconsistency the rule resolves.
+> **Status: implemented.** Treated as still-`v1` (no compatibility with older
+> `.d3dasm` text is kept; artifacts are regenerated). **Done:** uniform
+> `key=value` tags and `profile=`/`fourcc=` in SHEX; always-emit `samples=`;
+> `dim=`/`rt=` resource tags; whitespace-separated operands with `,`-only list
+> values and `+`-no-space relative indices; STAT and signatures in `key=value`
+> form with `.xyzw`/`none` masks; unknown tags are errors; **self-contained
+> RDEF** — `used=true|false` is always emitted and the SHEX-program derivation is
+> gone (RDEF parses standalone); `key=value` RDEF headers (`target=`/`version=`)
+> and a `.code RDEF form=hlsl|kv` marker. **Intentionally not done** (low value /
+> already unambiguous): the `@reg` shorthand (HLSL `register(...)` kept), typed
+> `f32(...)` immediate literals (bare `0x` raw-bits already round-trip), and the
+> `//`-comment-hardening / name-quoting (no current data triggers it). Section
+> references like *(fixes §12.1)* point at the inconsistency the rule resolves.
 
 ---
 
