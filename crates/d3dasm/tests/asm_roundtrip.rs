@@ -293,7 +293,10 @@ fn shdr_fourcc_preserved() {
         fourcc: *b"SHDR",
     };
     let text = serialize(&p);
-    assert!(text.starts_with("vs_4_0 SHDR\n"), "text:\n{text}");
+    assert!(
+        text.starts_with("profile=vs_4_0 fourcc=SHDR\n"),
+        "text:\n{text}"
+    );
     let p2 = assemble(&text).expect("parse failed");
     assert_eq!(p2, p, "SHDR round-trip mismatch\n{text}");
 }
@@ -466,9 +469,9 @@ fn vector_immediate_has_no_trailing_colon() {
 }
 
 #[test]
-fn dcl_resource_non_ms_omits_samples() {
-    // A non-multisampled resource must not emit `samples(0)`; a multisampled one
-    // must keep `samples(N)`. Both round-trip.
+fn dcl_resource_uses_named_tags() {
+    // A resource declaration is self-describing: operand first, then `dim=`,
+    // `rt=`, and an always-present `samples=` tag. Both round-trip.
     let t = |dim| {
         let r = reg_op(
             RegisterType::Resource,
@@ -488,11 +491,15 @@ fn dcl_resource_non_ms_omits_samples() {
 
     let tex2d = t("texture2d");
     let text = serialize(&decode(&encode(&tex2d)).unwrap());
-    assert!(!text.contains("samples("), "non-MS leaked samples:\n{text}");
+    assert!(
+        text.contains("dim=texture2d rt=float,float,float,float samples=0"),
+        "unexpected resource text:\n{text}"
+    );
     rt(&tex2d);
 
     let texms = t("texture2dms");
     let text = serialize(&decode(&encode(&texms)).unwrap());
-    assert!(text.contains("samples(0)"), "MS dropped samples:\n{text}");
+    assert!(text.contains("dim=texture2dms"), "MS dim missing:\n{text}");
+    assert!(text.contains("samples=0"), "samples missing:\n{text}");
     rt(&texms);
 }

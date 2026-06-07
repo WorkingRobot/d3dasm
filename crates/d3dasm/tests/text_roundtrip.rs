@@ -96,7 +96,7 @@ fn container_text_roundtrip() {
 
     // The text should look like assembly (sanity check on a couple of lines).
     assert!(
-        text.starts_with("ps_5_0\n"),
+        text.starts_with("profile=ps_5_0\n"),
         "unexpected profile line:\n{text}"
     );
     assert!(

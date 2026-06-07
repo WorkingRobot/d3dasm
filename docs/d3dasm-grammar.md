@@ -22,6 +22,14 @@ intended, consistent rule.
 > *Recommended grammar* notes in §12 are forward-looking; the *Observed* rules
 > are what the current code does. A future parser should follow **Observed**
 > for compatibility and may additionally accept the **Recommended** relaxations.
+>
+> **Note (grammar in flux).** Several sections — STAT (§8), signatures (§7), and
+> the SHEX declaration tags / profile line (§9) — have been moved to a uniform
+> `key=value` tag form and a `profile=` header (resolving parts of §12.1/§12.9).
+> The worked example in §10 shows the current output. RDEF (§5–6) and the
+> operand list still use the forms documented below; see
+> [`d3dasm-desired-grammar.md`](d3dasm-desired-grammar.md) for the remaining
+> target changes.
 
 ## Source of truth
 
@@ -622,16 +630,18 @@ cbuffer cbShared : register(b0) flags=userPacked {
     bool gDirLightEnabled : packoffset(c4);
 };
 .code ISGN
-SV_Position idx=0 reg=0 type=float mask=xyzw rw=0 sv=position
+SV_Position idx=0 reg=0 type=float mask=.xyzw rw=none sv=position
 .code SHEX
-ps_5_0
+profile=ps_5_0
 dcl_globalFlags refactoringAllowed
-dcl_constantbuffer cb0[32].xyzw access(dynamicIndexed)
-dcl_resource texture2darray (float,float,float,float) t0
+dcl_constantbuffer cb0[32].xyzw access=dynamicIndexed
+dcl_resource t0 dim=texture2darray rt=float,float,float,float samples=0
 sample_res(texture2darray)_rt(float,float,float,float) r6:z, r7.zxwz, t0.yzxw, s1
 ret
 .code STAT
-instructions 191
+size=148
+sample_frequency=false
+instructions=191
 .end
 ```
 

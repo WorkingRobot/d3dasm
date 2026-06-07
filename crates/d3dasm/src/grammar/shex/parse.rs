@@ -65,9 +65,17 @@ pub fn parse(text: &str) -> Result<Program, AsmError> {
 }
 
 fn parse_profile(line: &str) -> Result<(&'static str, u32, u32, [u8; 4]), AsmError> {
-    // <st>_<major>_<minor> [FOURCC], e.g. `ps_5_0` or `ps_5_0 SHDR`.
+    // profile=<st>_<major>_<minor> [fourcc=XXXX], e.g. `profile=ps_5_0`.
+    let line = line
+        .strip_prefix("profile=")
+        .ok_or_else(|| AsmError {
+            message: format!("expected `profile=` line: {line:?}"),
+        })?;
     let (profile, fourcc) = match line.split_once(' ') {
-        Some((p, f)) => {
+        Some((p, rest)) => {
+            let f = rest.trim().strip_prefix("fourcc=").ok_or_else(|| AsmError {
+                message: format!("expected `fourcc=` tag: {rest:?}"),
+            })?;
             let bytes = f.as_bytes();
             if bytes.len() != 4 {
                 return err(format!("fourcc must be 4 bytes: {f:?}"));
@@ -451,13 +459,10 @@ fn parse_dcl_output(c: &mut Cursor) -> Result<InstructionKind, AsmError> {
 }
 
 fn parse_dcl_resource(c: &mut Cursor) -> Result<InstructionKind, AsmError> {
-    c.skip_spaces();
-    let dimension = intern_enum(c.take_token(), DIMENSIONS)?;
-    c.skip_spaces();
-    let return_type = parse_return_types(c)?;
     let op0 = parse_leading_operand(c)?;
-    // `samples(N)` is only emitted for multisampled resources; absent → 0.
-    let sample_count = parse_tag_dec_opt(c, "samples")?.unwrap_or(0);
+    let dimension = parse_tag_enum(c, "dim", DIMENSIONS)?;
+    let return_type = parse_rt_tag(c)?;
+    let sample_count = parse_tag_dec(c, "samples")?;
     Ok(InstructionKind::DclResource {
         dimension,
         sample_count,
@@ -467,11 +472,9 @@ fn parse_dcl_resource(c: &mut Cursor) -> Result<InstructionKind, AsmError> {
 }
 
 fn parse_dcl_uav_typed(c: &mut Cursor) -> Result<InstructionKind, AsmError> {
-    c.skip_spaces();
-    let dimension = intern_enum(c.take_token(), DIMENSIONS)?;
-    c.skip_spaces();
-    let return_type = parse_return_types(c)?;
     let op0 = parse_leading_operand(c)?;
+    let dimension = parse_tag_enum(c, "dim", DIMENSIONS)?;
+    let return_type = parse_rt_tag(c)?;
     let flags = parse_tag_hex(c, "flags")?;
     Ok(InstructionKind::DclUavTyped {
         dimension,
@@ -531,20 +534,16 @@ fn parse_gs_topology(tok: &str) -> Result<GsOutputTopology, AsmError> {
     })
 }
 
-fn parse_return_types(c: &mut Cursor) -> Result<[ReturnType; 4], AsmError> {
-    if !c.eat_byte(b'(') {
-        return err("expected '(' for return types");
-    }
+/// Parse an `rt=float,float,float,float` tag into the four resource return types.
+fn parse_rt_tag(c: &mut Cursor) -> Result<[ReturnType; 4], AsmError> {
+    let inner = expect_tag(c, "rt")?;
     let mut rts = [ReturnType::Unknown(0); 4];
-    for (i, slot) in rts.iter_mut().enumerate() {
-        if i > 0 && !c.eat_byte(b',') {
-            return err("expected ',' between return types");
-        }
-        let name = c.take_while(|b| b != b',' && b != b')');
+    let mut it = inner.split(',');
+    for slot in rts.iter_mut() {
+        let name = it.next().ok_or_else(|| AsmError {
+            message: format!("rt= needs four types: {inner:?}"),
+        })?;
         *slot = parse_return_type(name)?;
-    }
-    if !c.eat_byte(b')') {
-        return err("expected ')' after return types");
     }
     Ok(rts)
 }
@@ -927,30 +926,17 @@ fn parse_tag_dec<T: core::str::FromStr>(c: &mut Cursor, tag: &str) -> Result<T, 
     parse_dec(inner)
 }
 
-/// Like [`parse_tag_dec`] but returns `None` when the tag is absent instead of
-/// erroring (for optional trailing tags such as `samples(...)`).
-fn parse_tag_dec_opt<T: core::str::FromStr>(
-    c: &mut Cursor,
-    tag: &str,
-) -> Result<Option<T>, AsmError> {
-    c.skip_spaces();
-    match c.try_tag(tag)? {
-        Some(inner) => Ok(Some(parse_dec(inner)?)),
-        None => Ok(None),
-    }
-}
-
 fn parse_tag_hex(c: &mut Cursor, tag: &str) -> Result<u32, AsmError> {
     let inner = expect_tag(c, tag)?;
     parse_hex0x(inner)
 }
 
-/// Skip a leading space then require `tag(...)`, returning the inner text.
+/// Skip a leading space then require `tag=value`, returning the value text.
 fn expect_tag<'a>(c: &mut Cursor<'a>, tag: &str) -> Result<&'a str, AsmError> {
     c.skip_spaces();
     match c.try_tag(tag)? {
         Some(inner) => Ok(inner),
-        None => err(format!("expected {tag}(...) at {:?}", c.rest())),
+        None => err(format!("expected {tag}=… at {:?}", c.rest())),
     }
 }
 
@@ -1087,21 +1073,18 @@ impl<'a> Cursor<'a> {
         &self.src[start..]
     }
 
-    /// If the cursor is at `tag(`, consume through the matching `)` and return
-    /// the inner text. Inner text must not contain `)`.
+    /// If the cursor is at `tag=`, consume `tag=` and return the value token
+    /// (everything up to the next whitespace). The value itself is never empty
+    /// of meaning here — list values like `float,float,float,float` contain no
+    /// spaces by construction.
     fn try_tag(&mut self, tag: &str) -> Result<Option<&'a str>, AsmError> {
         let mut probe = String::from(tag);
-        probe.push('(');
+        probe.push('=');
         if !self.looking_at(&probe) {
             return Ok(None);
         }
         self.advance(probe.len());
-        let inner = self.take_while(|b| b != b')');
-        if !self.eat_byte(b')') {
-            return Err(AsmError {
-                message: format!("expected ')' closing {tag}(...)"),
-            });
-        }
+        let inner = self.take_while(|b| b != b' ' && b != b'\t');
         Ok(Some(inner))
     }
 }

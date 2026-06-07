@@ -22,13 +22,13 @@ pub fn serialize(program: &Program) -> String {
 fn write_program(w: &mut String, p: &Program) -> core::fmt::Result {
     write!(
         w,
-        "{}_{}_{}",
+        "profile={}_{}_{}",
         p.shader_type, p.major_version, p.minor_version
     )?;
     // Preserve the chunk FourCC when it is not the default `SHEX`.
     if &p.fourcc != b"SHEX" {
         let fourcc = core::str::from_utf8(&p.fourcc).unwrap_or("SHEX");
-        write!(w, " {fourcc}")?;
+        write!(w, " fourcc={fourcc}")?;
     }
     w.push('\n');
     for instr in &p.instructions {
@@ -323,15 +323,15 @@ fn write_declaration(w: &mut String, instr: &Instruction) -> core::fmt::Result {
             system_value,
             operands,
         } => {
-            if let Some(interp) = interpolation {
-                write!(w, " interp({interp})")?;
-            }
             for op in operands {
                 w.push(' ');
                 write_operand(w, op, ImmediateType::Uint);
             }
+            if let Some(interp) = interpolation {
+                write!(w, " interp={interp}")?;
+            }
             if let Some(sv) = system_value {
-                write!(w, " sv({sv})")?;
+                write!(w, " sv={sv}")?;
             }
         }
         InstructionKind::DclOutput {
@@ -343,7 +343,7 @@ fn write_declaration(w: &mut String, instr: &Instruction) -> core::fmt::Result {
                 write_operand(w, op, ImmediateType::Uint);
             }
             if let Some(sv) = system_value {
-                write!(w, " sv({sv})")?;
+                write!(w, " sv={sv}")?;
             }
         }
         InstructionKind::DclResource {
@@ -352,24 +352,19 @@ fn write_declaration(w: &mut String, instr: &Instruction) -> core::fmt::Result {
             return_type,
             operands,
         } => {
-            write!(w, " {dimension} ")?;
-            write_return_types(w, return_type);
             write_op0(w, operands);
-            // The sample count is only meaningful for multisampled resources;
-            // fxc shows it there (even when 0) and omits it otherwise. Keep a
-            // non-zero count regardless so any input round-trips.
-            let is_ms = matches!(*dimension, "texture2dms" | "texture2dmsarray");
-            if is_ms || *sample_count != 0 {
-                write!(w, " samples({sample_count})")?;
-            }
+            write!(w, " dim={dimension} rt=")?;
+            write_return_types(w, return_type);
+            // Always emitted so the declaration is self-describing.
+            write!(w, " samples={sample_count}")?;
         }
         InstructionKind::DclSampler { mode, operands } => {
             write_op0(w, operands);
-            write!(w, " mode({mode})")?;
+            write!(w, " mode={mode}")?;
         }
         InstructionKind::DclConstantBuffer { access, operands } => {
             write_op0(w, operands);
-            write!(w, " access({access})")?;
+            write!(w, " access={access}")?;
         }
         InstructionKind::DclTemps { count } => {
             write!(w, " {count}")?;
@@ -413,14 +408,14 @@ fn write_declaration(w: &mut String, instr: &Instruction) -> core::fmt::Result {
             return_type,
             operands,
         } => {
-            write!(w, " {dimension} ")?;
-            write_return_types(w, return_type);
             write_op0(w, operands);
-            write!(w, " flags(0x{flags:x})")?;
+            write!(w, " dim={dimension} rt=")?;
+            write_return_types(w, return_type);
+            write!(w, " flags=0x{flags:x}")?;
         }
         InstructionKind::DclUavRaw { flags, operands } => {
             write_op0(w, operands);
-            write!(w, " flags(0x{flags:x})")?;
+            write!(w, " flags=0x{flags:x}")?;
         }
         InstructionKind::DclUavStructured {
             flags,
@@ -428,14 +423,14 @@ fn write_declaration(w: &mut String, instr: &Instruction) -> core::fmt::Result {
             operands,
         } => {
             write_op0(w, operands);
-            write!(w, " stride({stride}) flags(0x{flags:x})")?;
+            write!(w, " stride={stride} flags=0x{flags:x}")?;
         }
         InstructionKind::DclResourceRaw { operands } => {
             write_op0(w, operands);
         }
         InstructionKind::DclResourceStructured { stride, operands } => {
             write_op0(w, operands);
-            write!(w, " stride({stride})")?;
+            write!(w, " stride={stride}")?;
         }
         InstructionKind::DclFunctionBody { index } => {
             write!(w, " {index}")?;
@@ -473,8 +468,9 @@ fn write_op0(w: &mut String, operands: &Operands) {
     }
 }
 
+/// Write the four resource return types as a bare `t,t,t,t` list (the value of
+/// an `rt=` tag).
 fn write_return_types(w: &mut String, rt: &[ReturnType; 4]) {
-    w.push('(');
     for (i, t) in rt.iter().enumerate() {
         if i > 0 {
             w.push(',');
@@ -486,7 +482,6 @@ fn write_return_types(w: &mut String, rt: &[ReturnType; 4]) {
             other => w.push_str(other.name()),
         }
     }
-    w.push(')');
 }
 
 fn write_u32_list(w: &mut String, list: &SmallU32Vec) {

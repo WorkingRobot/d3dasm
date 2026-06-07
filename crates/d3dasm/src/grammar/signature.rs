@@ -42,15 +42,16 @@ fn comp_type_from(s: &str) -> Option<u32> {
     })
 }
 
-/// Component mask → `.xyzw` letters (or hex for non-standard masks).
+/// Component mask → `.xyzw` letters, `none` when empty (or hex for the rare
+/// non-standard masks with high bits set).
 fn mask_to_str(m: u8) -> String {
     if m == 0 {
-        return String::from("0");
+        return String::from("none");
     }
     if m & 0xf0 != 0 {
         return format!("{m:02x}");
     }
-    let mut s = String::new();
+    let mut s = String::from(".");
     for (bit, ch) in [(1u8, 'x'), (2, 'y'), (4, 'z'), (8, 'w')] {
         if m & bit != 0 {
             s.push(ch);
@@ -59,12 +60,15 @@ fn mask_to_str(m: u8) -> String {
     s
 }
 
-/// Parse a component mask: `.xyzw` letters or a hex number.
+/// Parse a component mask: `none`, `.xyzw` letters, or a hex number.
 fn mask_from(s: &str) -> Option<u8> {
-    let s = s.strip_prefix('.').unwrap_or(s);
-    if !s.is_empty() && s.bytes().all(|b| matches!(b, b'x' | b'y' | b'z' | b'w')) {
+    if s == "none" {
+        return Some(0);
+    }
+    let body = s.strip_prefix('.').unwrap_or(s);
+    if !body.is_empty() && body.bytes().all(|b| matches!(b, b'x' | b'y' | b'z' | b'w')) {
         let mut m = 0u8;
-        for c in s.bytes() {
+        for c in body.bytes() {
             m |= match c {
                 b'x' => 1,
                 b'y' => 2,
@@ -73,8 +77,10 @@ fn mask_from(s: &str) -> Option<u8> {
             };
         }
         Some(m)
+    } else if s.starts_with('.') {
+        None // dotted but not valid component letters
     } else {
-        u8::from_str_radix(s, 16).ok()
+        u8::from_str_radix(body, 16).ok()
     }
 }
 
@@ -190,11 +196,15 @@ pub fn signature_from_text(fourcc: [u8; 4], text: &str) -> Option<Signature<'sta
         } else {
             Cow::Owned(String::from(name))
         };
+        const KNOWN: &[&str] = &["idx", "reg", "type", "mask", "rw", "sv", "stream", "prec"];
         let mut m: BTreeMap<&str, &str> = BTreeMap::new();
         for tok in f {
-            if let Some((k, v)) = tok.split_once('=') {
-                m.insert(k, v);
+            // Every token after the name must be a known `key=value` tag.
+            let (k, v) = tok.split_once('=')?;
+            if !KNOWN.contains(&k) {
+                return None;
             }
+            m.insert(k, v);
         }
         let semantic_index = m.get("idx")?.parse().ok()?;
         let register = m.get("reg")?.parse().ok()?;

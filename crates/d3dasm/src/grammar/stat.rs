@@ -88,24 +88,29 @@ fn set_field(s: &mut ShaderStats, key: &str, v: u32) -> bool {
     true
 }
 
-/// Serialize STAT to editable `key value` lines (plus `size` and `reserved`,
+/// Serialize STAT to editable `key=value` lines (plus `size` and `reserved`,
 /// needed to reproduce the exact byte length).
 pub fn stat_to_text(s: &ShaderStats) -> String {
     let mut o = String::new();
-    let _ = writeln!(o, "size {}", s.raw_size);
-    let _ = writeln!(o, "sample_frequency {}", s.is_sample_frequency as u32);
+    let _ = writeln!(o, "size={}", s.raw_size);
     let _ = writeln!(
         o,
-        "reserved {} {} {} {}",
+        "sample_frequency={}",
+        if s.is_sample_frequency { "true" } else { "false" }
+    );
+    let _ = writeln!(
+        o,
+        "reserved={},{},{},{}",
         s.reserved[0], s.reserved[1], s.reserved[2], s.reserved[3]
     );
     for (k, v) in stat_fields(s) {
-        let _ = writeln!(o, "{k} {v}");
+        let _ = writeln!(o, "{k}={v}");
     }
     o
 }
 
-/// Parse the editable text form produced by [`stat_to_text`].
+/// Parse the editable text form produced by [`stat_to_text`]. Whitespace around
+/// the `=` and list commas is ignored; an unknown key is an error.
 pub fn stat_from_text(text: &str) -> Option<ShaderStats> {
     let mut s = ShaderStats::default();
     for line in text.lines() {
@@ -113,18 +118,19 @@ pub fn stat_from_text(text: &str) -> Option<ShaderStats> {
         if line.is_empty() {
             continue;
         }
-        let mut f = line.split_whitespace();
-        let key = f.next()?;
+        let (key, val) = line.split_once('=')?;
+        let (key, val) = (key.trim(), val.trim());
         match key {
-            "size" => s.raw_size = f.next()?.parse().ok()?,
-            "sample_frequency" => s.is_sample_frequency = f.next()?.parse::<u32>().ok()? != 0,
+            "size" => s.raw_size = val.parse().ok()?,
+            "sample_frequency" => s.is_sample_frequency = parse_bool(val)?,
             "reserved" => {
+                let mut it = val.split(',');
                 for slot in &mut s.reserved {
-                    *slot = f.next()?.parse().ok()?;
+                    *slot = it.next()?.trim().parse().ok()?;
                 }
             }
             other => {
-                let v = f.next()?.parse().ok()?;
+                let v = val.parse().ok()?;
                 if !set_field(&mut s, other, v) {
                     return None;
                 }
@@ -132,4 +138,13 @@ pub fn stat_from_text(text: &str) -> Option<ShaderStats> {
         }
     }
     Some(s)
+}
+
+/// Parse a `true`/`false` boolean literal.
+fn parse_bool(s: &str) -> Option<bool> {
+    match s {
+        "true" => Some(true),
+        "false" => Some(false),
+        _ => None,
+    }
 }
