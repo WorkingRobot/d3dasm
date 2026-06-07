@@ -42,16 +42,31 @@ pub fn serialize(shader: &Shader) -> String {
     let _ = write!(out, "{}", container.version);
     out.push('\n');
 
+    // Resource definitions, used to symbolicate cbuffer/resource operands in the
+    // SHEX body (as `//` comments — stripped on parse, so round-trip is safe).
+    let rdef = container
+        .chunks
+        .iter()
+        .find(|c| c.fourcc_str() == "RDEF")
+        .and_then(|c| dxbc::chunks::rdef::parse_rdef(c.data));
+
     for chunk in &container.chunks {
         // A chunk becomes an editable `.code` block only when we have a text
         // codec for it AND that codec is verified to round-trip these exact
         // bytes (see `chunk_to_body`); otherwise it is preserved as raw hex.
-        if let Some(body) = chunk_to_body(chunk.fourcc, chunk.data) {
+        if let Some(mut body) = chunk_to_body(chunk.fourcc, chunk.data) {
             // RDEF carries a `form=` tag naming which editable form was used.
             if &chunk.fourcc == b"RDEF" {
                 let _ = writeln!(out, ".code RDEF form={}", rdef_form(&body));
             } else {
                 let _ = writeln!(out, ".code {}", chunk.fourcc_str());
+            }
+            // Annotate the shader program's resource operands with their names.
+            if matches!(chunk.fourcc_str(), "SHEX" | "SHDR")
+                && let Some(rd) = &rdef
+                && let Ok(program) = dxbc::shex::decode_with_fourcc(chunk.data, chunk.fourcc)
+            {
+                body = crate::symbolicate::annotate_shex(&body, &program, rd);
             }
             out.push_str(&body);
         } else {

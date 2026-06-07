@@ -19,6 +19,14 @@ pub fn serialize(program: &Program) -> String {
     s
 }
 
+/// Render a single operand in `.d3dasm` form (e.g. `cb0[21].w`, `cb0[r0.y+11].x`,
+/// `t0.yzxw`). Used to label resource operands in symbolication comments.
+pub fn operand_string(op: &Operand) -> String {
+    let mut s = String::new();
+    write_operand(&mut s, op, ImmediateType::Float);
+    s
+}
+
 fn write_program(w: &mut String, p: &Program) -> core::fmt::Result {
     write!(
         w,

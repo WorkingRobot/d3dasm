@@ -43,6 +43,8 @@ pub mod container_doc;
 mod forensic;
 /// The `.d3dasm` text grammar — per-chunk serialize/parse codecs.
 pub mod grammar;
+/// Resolve cbuffer/resource register operands to source names (analysis layer).
+pub mod symbolicate;
 
 /// Serialize a shader [`dxbc::Program`] to lossless `.d3dasm` text, and parse it
 /// back. These mirror the old `dxbc::{serialize,assemble}` entry points, which

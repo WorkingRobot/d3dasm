@@ -45,7 +45,7 @@ mod parse;
 mod serialize;
 
 pub use self::parse::{AsmError, parse};
-pub use self::serialize::serialize;
+pub use self::serialize::{operand_string, serialize};
 
 /// Component axis letters, indexed by component number (x=0..w=3).
 pub(crate) const AXES: [char; 4] = ['x', 'y', 'z', 'w'];

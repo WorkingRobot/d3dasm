@@ -98,6 +98,11 @@ Consequences a parser must honor:
 - Indentation is **purely cosmetic** — it is removed before parsing. The 4-space
   indents in struct/cbuffer bodies and the 2-space indents in hex blocks carry
   no meaning.
+- The serializer uses trailing `//` comments to **symbolicate** SHEX lines —
+  resolving cbuffer/texture/sampler/UAV register operands to their RDEF source
+  names, e.g. `mad r0:y r0.y r0.z cb0[21].w  // cb0[21].w = gDirLightColor.w`.
+  These are an analysis aid only; being comments, they are dropped on parse and
+  the faithful operand round-trips unchanged.
 - A `//` comment runs to end-of-line and can appear on its own line or trailing
   a content line.
 - Blank lines are insignificant separators only.
