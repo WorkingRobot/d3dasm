@@ -15,8 +15,12 @@ use alloc::string::String;
 use alloc::vec::Vec;
 use core::fmt::Write as _;
 
-use super::rdef::{ResourceBinding, ResourceDef, TypeDesc, hlsl_type_name, parse_hlsl_type};
-use crate::shex::{ComponentSelect, Operand, OperandIndex, Program, RegisterType};
+use dxbc::chunks::rdef::{
+    ResourceBinding, ResourceDef, ResourceDimension, SIF_COMPARISON_SAMPLER, SIF_TEX_COMPONENTS,
+    SIF_TEXTURE_COMPONENT_0, SIF_TEXTURE_COMPONENT_1, SIF_UNUSED, SIF_USER_PACKED, TypeDesc,
+    hlsl_type_name, parse_hlsl_type,
+};
+use dxbc::shex::{ComponentSelect, Operand, OperandIndex, Program, RegisterType};
 
 // ---------------------------------------------------------------------------
 // Constant-buffer usage analysis (derives the `used` flag from the program)
@@ -327,15 +331,6 @@ fn packoffset_parse(s: &str) -> Option<u32> {
     Some(reg * 16 + comp * 4)
 }
 
-/// `D3D_SHADER_INPUT_FLAGS` bits (the binding-flags field uses different bit
-/// meanings than the variable-flags field).
-const SIF_USER_PACKED: u32 = 0x1;
-const SIF_COMPARISON_SAMPLER: u32 = 0x2;
-const SIF_TEXTURE_COMPONENT_0: u32 = 0x4;
-const SIF_TEXTURE_COMPONENT_1: u32 = 0x8;
-const SIF_UNUSED: u32 = 0x10;
-/// The two texture-component bits encode (component count − 1).
-const SIF_TEX_COMPONENTS: u32 = SIF_TEXTURE_COMPONENT_0 | SIF_TEXTURE_COMPONENT_1;
 
 /// Binding flags → `userPacked|comparisonSampler|...` (or hex for unknown bits).
 /// `0` for an explicit no-flags override (when the derivation would set bits).
@@ -396,37 +391,13 @@ fn derived_binding_flags(input_type: u32, return_type: u32) -> u32 {
     }
 }
 
-/// Texture/UAV dimension → HLSL type stem.
+/// Texture/UAV dimension (raw `D3D_SRV_DIMENSION`) → HLSL type stem.
 fn dim_to_hlsl(d: u32) -> Option<&'static str> {
-    Some(match d {
-        1 => "Buffer",
-        2 => "Texture1D",
-        3 => "Texture2D",
-        4 => "Texture2DMS",
-        5 => "Texture3D",
-        6 => "TextureCube",
-        7 => "Texture1DArray",
-        8 => "Texture2DArray",
-        9 => "Texture2DMSArray",
-        10 => "TextureCubeArray",
-        _ => return None,
-    })
+    Some(ResourceDimension::from_u32(d)?.hlsl_stem())
 }
 
 fn dim_from_hlsl(s: &str) -> Option<u32> {
-    Some(match s {
-        "Buffer" => 1,
-        "Texture1D" => 2,
-        "Texture2D" => 3,
-        "Texture2DMS" => 4,
-        "Texture3D" => 5,
-        "TextureCube" => 6,
-        "Texture1DArray" => 7,
-        "Texture2DArray" => 8,
-        "Texture2DMSArray" => 9,
-        "TextureCubeArray" => 10,
-        _ => return None,
-    })
+    Some(ResourceDimension::from_hlsl_stem(s)? as u32)
 }
 
 /// Resource return type → HLSL element spelling (None when there is none).

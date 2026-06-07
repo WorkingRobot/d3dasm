@@ -15,6 +15,16 @@ Parses DXBC containers, decodes SM4/SM5 shader bytecode into a fully typed inter
 - **`no_std` core** — The `dxbc` crate uses only `core` and `alloc`, no filesystem or I/O.
 - **All shader stages** — VS, PS, GS, HS, DS, CS.
 
+## Documentation
+
+- [`docs/d3dasm-grammar.md`](docs/d3dasm-grammar.md) — the full grammar of the
+  **current** `.d3dasm` text format (container document, RDEF-as-HLSL,
+  signatures, STAT, and the SHEX instruction body), with the known
+  inconsistencies a future parser must handle.
+- [`docs/d3dasm-desired-grammar.md`](docs/d3dasm-desired-grammar.md) — the
+  **target** redesign that resolves those inconsistencies into a consistent,
+  context-free grammar (a future `v2` of the format).
+
 ## Crates
 
 | Crate        | Type           | Purpose                                                                                       |

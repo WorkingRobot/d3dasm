@@ -38,8 +38,8 @@ fn main() {
                 // baseline the text round-trip must also hit.
                 let baseline = dxbc::shex::encode(&prog);
 
-                let text = dxbc::shex::serialize(&prog);
-                let parsed = match dxbc::shex::assemble(&text) {
+                let text = d3dasm::serialize(&prog);
+                let parsed = match d3dasm::assemble(&text) {
                     Ok(p) => p,
                     Err(e) => {
                         failed += 1;

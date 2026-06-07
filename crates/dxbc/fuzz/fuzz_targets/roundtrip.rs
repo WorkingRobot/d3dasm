@@ -13,9 +13,10 @@ use arbitrary::Unstructured;
 use libfuzzer_sys::fuzz_target;
 use smallvec::SmallVec;
 
+use d3dasm::{assemble, serialize};
 use dxbc::shex::{
     ComponentSelect, Immediates, Indices, Instruction, InstructionKind, Opcode, Operand,
-    OperandIndex, Operands, Program, RegisterType, assemble, decode, encode, serialize,
+    OperandIndex, Operands, Program, RegisterType, decode, encode,
 };
 
 const FUZZ_OPCODES: &[Opcode] = &[

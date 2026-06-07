@@ -1,10 +1,8 @@
 //! Input/output/patch-constant signature parsing (ISGN, OSGN, PCSG, ISG1, OSG1, PSG1).
 
 use alloc::borrow::Cow;
-use alloc::string::String;
 use alloc::vec::Vec;
 use core::fmt;
-use core::fmt::Write as _;
 
 use super::{ChunkWriter, WritableChunk};
 
@@ -74,11 +72,13 @@ impl SignatureVersion {
         }
     }
 
-    fn has_stream(self) -> bool {
+    /// Whether this layout carries a per-element GS output `stream`.
+    pub fn has_stream(self) -> bool {
         matches!(self, Self::V5 | Self::V1)
     }
 
-    fn has_min_precision(self) -> bool {
+    /// Whether this layout carries a per-element `min_precision` field.
+    pub fn has_min_precision(self) -> bool {
         matches!(self, Self::V1)
     }
 }
@@ -107,7 +107,8 @@ pub enum MinPrecision {
 }
 
 impl MinPrecision {
-    fn from_u32(v: u32) -> Self {
+    /// Converts a raw `D3D_MIN_PRECISION` value to the corresponding variant.
+    pub fn from_u32(v: u32) -> Self {
         match v {
             0 => Self::Default,
             1 => Self::Float16,
@@ -121,7 +122,8 @@ impl MinPrecision {
         }
     }
 
-    fn to_u32(self) -> u32 {
+    /// The raw `D3D_MIN_PRECISION` value for this variant.
+    pub fn to_u32(self) -> u32 {
         match self {
             Self::Default => 0,
             Self::Float16 => 1,
@@ -387,225 +389,6 @@ pub fn parse_signature<'a>(fourcc: &str, data: &'a [u8]) -> Vec<SignatureElement
     }
 
     elements
-}
-
-/// Component type `D3D_REGISTER_COMPONENT_TYPE` → editable name (or number).
-fn comp_type_to_str(v: u32) -> String {
-    match ComponentType::from_u32(v) {
-        Some(ct) => String::from(ct.name()),
-        None => alloc::format!("{v}"),
-    }
-}
-
-/// Parse a component type: a known name or a raw number.
-fn comp_type_from(s: &str) -> Option<u32> {
-    Some(match s {
-        "unknown" => 0,
-        "uint" => 1,
-        "int" => 2,
-        "float" => 3,
-        "uint16" => 4,
-        "int16" => 5,
-        "float16" => 6,
-        "uint64" => 7,
-        "int64" => 8,
-        "float64" => 9,
-        _ => return s.parse().ok(),
-    })
-}
-
-/// Component mask → `.xyzw` letters (or hex for non-standard masks).
-fn mask_to_str(m: u8) -> String {
-    if m == 0 {
-        return String::from("0");
-    }
-    if m & 0xf0 != 0 {
-        return alloc::format!("{m:02x}");
-    }
-    let mut s = String::new();
-    for (bit, ch) in [(1u8, 'x'), (2, 'y'), (4, 'z'), (8, 'w')] {
-        if m & bit != 0 {
-            s.push(ch);
-        }
-    }
-    s
-}
-
-/// Parse a component mask: `.xyzw` letters or a hex number.
-fn mask_from(s: &str) -> Option<u8> {
-    let s = s.strip_prefix('.').unwrap_or(s);
-    if !s.is_empty() && s.bytes().all(|b| matches!(b, b'x' | b'y' | b'z' | b'w')) {
-        let mut m = 0u8;
-        for c in s.bytes() {
-            m |= match c {
-                b'x' => 1,
-                b'y' => 2,
-                b'z' => 4,
-                _ => 8,
-            };
-        }
-        Some(m)
-    } else {
-        u8::from_str_radix(s, 16).ok()
-    }
-}
-
-/// System value `D3D_NAME` → editable name (or number for unrecognised values).
-fn sysval_to_str(v: u32) -> String {
-    let n = crate::shex::system_value_name(v);
-    if n == "unknown_sv" {
-        alloc::format!("{v}")
-    } else {
-        String::from(n)
-    }
-}
-
-/// Parse a system value: a known name or a raw number. Unknown names error.
-fn sysval_from(s: &str) -> Option<u32> {
-    if let Ok(n) = s.parse::<u32>() {
-        return Some(n);
-    }
-    let v = crate::shex::system_value_to_u32(s);
-    if v == 0 && s != "undefined" {
-        None // unrecognised name — surface a loud error rather than silently 0
-    } else {
-        Some(v)
-    }
-}
-
-/// Minimum precision → editable name (or number).
-fn minprec_to_str(v: u32) -> String {
-    String::from(match v {
-        1 => "min16f",
-        2 => "min2_8f",
-        3 => "reserved",
-        4 => "min16i",
-        5 => "min16u",
-        0xf0 => "any16",
-        0xf1 => "any10",
-        _ => return alloc::format!("{v}"),
-    })
-}
-
-/// Parse a minimum precision: a known name or a raw number.
-fn minprec_from(s: &str) -> Option<u32> {
-    Some(match s {
-        "min16f" => 1,
-        "min2_8f" => 2,
-        "reserved" => 3,
-        "min16i" => 4,
-        "min16u" => 5,
-        "any16" => 0xf0,
-        "any10" => 0xf1,
-        _ => return s.parse().ok(),
-    })
-}
-
-/// Serialize a signature to editable text, one element per line:
-/// `<name|-> idx=N reg=N type=<t> mask=<m> rw=<m> [sv=<name>] [stream=N] [prec=<name>]`.
-/// Enum fields use names (component type, masks, system value, precision);
-/// `sv`/`stream`/`prec` appear only when non-default.
-pub fn signature_to_text(sig: &Signature) -> String {
-    let fourcc_str = core::str::from_utf8(&sig.fourcc).unwrap_or("ISGN");
-    let ver = SignatureVersion::from_fourcc(fourcc_str);
-    let mut out = String::new();
-    for e in &sig.elements {
-        let name = if e.semantic_name.is_empty() {
-            "-"
-        } else {
-            &e.semantic_name
-        };
-        let _ = write!(
-            out,
-            "{name} idx={} reg={} type={} mask={} rw={}",
-            e.semantic_index,
-            e.register,
-            comp_type_to_str(e.component_type),
-            mask_to_str(e.mask),
-            mask_to_str(e.rw_mask),
-        );
-        if e.system_value != 0 {
-            let _ = write!(out, " sv={}", sysval_to_str(e.system_value));
-        }
-        if ver.has_stream()
-            && let Some(s) = e.stream
-            && s != 0
-        {
-            let _ = write!(out, " stream={s}");
-        }
-        if ver.has_min_precision()
-            && let Some(mp) = e.min_precision
-            && mp.to_u32() != 0
-        {
-            let _ = write!(out, " prec={}", minprec_to_str(mp.to_u32()));
-        }
-        out.push('\n');
-    }
-    out
-}
-
-/// Parse the editable text form produced by [`signature_to_text`]. Accepts both
-/// enum names and raw numbers; unrecognised names are an error (returns `None`).
-pub fn signature_from_text(fourcc: [u8; 4], text: &str) -> Option<Signature<'static>> {
-    let fourcc_str = core::str::from_utf8(&fourcc).unwrap_or("ISGN");
-    let ver = SignatureVersion::from_fourcc(fourcc_str);
-    let mut elements = Vec::new();
-    for line in text.lines() {
-        let line = line.trim();
-        if line.is_empty() {
-            continue;
-        }
-        let mut f = line.split_whitespace();
-        let name = f.next()?;
-        let semantic_name = if name == "-" {
-            Cow::Owned(String::new())
-        } else {
-            Cow::Owned(String::from(name))
-        };
-        let mut m: alloc::collections::BTreeMap<&str, &str> = alloc::collections::BTreeMap::new();
-        for tok in f {
-            if let Some((k, v)) = tok.split_once('=') {
-                m.insert(k, v);
-            }
-        }
-        let semantic_index = m.get("idx")?.parse().ok()?;
-        let register = m.get("reg")?.parse().ok()?;
-        let component_type = comp_type_from(m.get("type")?)?;
-        let mask = mask_from(m.get("mask")?)?;
-        let rw_mask = mask_from(m.get("rw")?)?;
-        let system_value = match m.get("sv") {
-            Some(s) => sysval_from(s)?,
-            None => 0,
-        };
-        let stream = if ver.has_stream() {
-            Some(match m.get("stream") {
-                Some(s) => s.parse().ok()?,
-                None => 0,
-            })
-        } else {
-            None
-        };
-        let min_precision = if ver.has_min_precision() {
-            Some(MinPrecision::from_u32(match m.get("prec") {
-                Some(s) => minprec_from(s)?,
-                None => 0,
-            }))
-        } else {
-            None
-        };
-        elements.push(SignatureElement {
-            semantic_name,
-            semantic_index,
-            system_value,
-            component_type,
-            register,
-            mask,
-            rw_mask,
-            stream,
-            min_precision,
-        });
-    }
-    Some(Signature { fourcc, elements })
 }
 
 /// Serialize a signature chunk back to bytes.

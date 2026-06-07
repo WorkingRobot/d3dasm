@@ -6,11 +6,11 @@ use alloc::string::String;
 use alloc::vec::Vec;
 
 use super::*;
-use crate::chunks::rdef::{
-    BIND_FLAG_USED, CBufferDef, CBufferVariable, MemberDesc, ResourceBinding, ResourceDef,
-    SLOT_UNUSED, TypeDesc,
+use dxbc::chunks::rdef::{
+    CBufferDef, CBufferVariable, MemberDesc, ResourceBinding, ResourceDef, SLOT_UNUSED, SVF_USED,
+    TypeDesc,
 };
-use crate::shex::Program;
+use dxbc::shex::Program;
 
 /// Collect `key=value` tokens (ignoring bare words) from an iterator.
 fn kv<'a>(it: impl Iterator<Item = &'a str>) -> BTreeMap<&'a str, &'a str> {
@@ -208,7 +208,7 @@ fn parse_var_tail<'a>(toks: impl Iterator<Item = &'a str> + Clone) -> Option<Var
     let mut flags: Option<u32> = None;
     for t in &toks {
         if *t == "used" {
-            flags = Some(BIND_FLAG_USED);
+            flags = Some(SVF_USED);
         } else if *t == "unused" {
             flags = Some(0);
         }
@@ -544,7 +544,7 @@ pub fn rdef_from_hlsl(text: &str, program: Option<&Program>) -> Option<ResourceD
                             name: Cow::Owned(String::from("$Element")),
                             offset: 0,
                             size,
-                            flags: BIND_FLAG_USED,
+                            flags: SVF_USED,
                             var_type: et,
                             default_value: Cow::Owned(Vec::new()),
                             texture_start: if sm5 { Some(SLOT_UNUSED) } else { None },
@@ -621,7 +621,7 @@ pub fn rdef_from_hlsl(text: &str, program: Option<&Program>) -> Option<ResourceD
         for v in &mut cb.variables {
             if v.flags == DERIVE_USED {
                 v.flags = match cbr {
-                    Some(r) if var_used(r, v.offset, v.size) => BIND_FLAG_USED,
+                    Some(r) if var_used(r, v.offset, v.size) => SVF_USED,
                     _ => 0,
                 };
             }

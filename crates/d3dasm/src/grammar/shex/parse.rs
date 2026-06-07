@@ -2,7 +2,7 @@
 //!
 //! Inverse of [`super::serialize::serialize`]. A byte-level cursor performs
 //! recursive-descent parsing; the per-opcode dispatch mirrors
-//! [`crate::shex::decode`] so the resulting IR re-encodes byte-identically.
+//! `dxbc::shex` decode so the resulting IR re-encodes byte-identically.
 
 use alloc::boxed::Box;
 use alloc::format;
@@ -15,8 +15,7 @@ use super::{
     CB_ACCESS, DIMENSIONS, GLOBAL_FLAGS, INTERPOLATIONS, SAMPLER_MODES, SHADER_TYPES, TESS_DOMAINS,
     TESS_OUTPUT_PRIMS, TESS_PARTITIONINGS, axis_index, intern, value_of,
 };
-use crate::shex::ir::*;
-use crate::shex::opcodes::Opcode;
+use dxbc::shex::*;
 
 /// Error produced while parsing `.d3dasm` text.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -457,7 +456,8 @@ fn parse_dcl_resource(c: &mut Cursor) -> Result<InstructionKind, AsmError> {
     c.skip_spaces();
     let return_type = parse_return_types(c)?;
     let op0 = parse_leading_operand(c)?;
-    let sample_count = parse_tag_dec(c, "samples")?;
+    // `samples(N)` is only emitted for multisampled resources; absent → 0.
+    let sample_count = parse_tag_dec_opt(c, "samples")?.unwrap_or(0);
     Ok(InstructionKind::DclResource {
         dimension,
         sample_count,
@@ -720,10 +720,15 @@ fn parse_operand(c: &mut Cursor) -> Result<Operand, AsmError> {
     };
 
     let mut components = parse_components(c)?;
-    // A bare inline immediate is 1-component — the `.1` is omitted on write
-    // (immediates are only ever 1-component or masked, never 0-component).
+    // A bare inline immediate carries no written component selection; restore the
+    // implied one the decoder produced from the value count: a scalar literal is
+    // 1-component, a vector literal is 4-component mask-mode with an empty mask.
     if !immediate_values.is_empty() && matches!(components, ComponentSelect::ZeroComponent) {
-        components = ComponentSelect::OneComponent;
+        components = if immediate_values.len() == 1 {
+            ComponentSelect::OneComponent
+        } else {
+            ComponentSelect::Mask(0)
+        };
     }
     if abs && !c.eat_byte(b'|') {
         return err("expected closing '|' for abs operand");
@@ -882,9 +887,9 @@ fn parse_components(c: &mut Cursor) -> Result<ComponentSelect, AsmError> {
 }
 
 fn intern_system_value(s: &str) -> Result<&'static str, AsmError> {
-    let val = crate::shex::encode::system_value_to_u32(s);
+    let val = dxbc::shex::system_value_to_u32(s);
     // Confirm it round-trips to the same canonical name decode would yield.
-    let canon = crate::shex::ir::system_value_name(val);
+    let canon = dxbc::shex::system_value_name(val);
     if canon == s {
         Ok(canon)
     } else {
@@ -920,6 +925,19 @@ fn parse_tag_enum(
 fn parse_tag_dec<T: core::str::FromStr>(c: &mut Cursor, tag: &str) -> Result<T, AsmError> {
     let inner = expect_tag(c, tag)?;
     parse_dec(inner)
+}
+
+/// Like [`parse_tag_dec`] but returns `None` when the tag is absent instead of
+/// erroring (for optional trailing tags such as `samples(...)`).
+fn parse_tag_dec_opt<T: core::str::FromStr>(
+    c: &mut Cursor,
+    tag: &str,
+) -> Result<Option<T>, AsmError> {
+    c.skip_spaces();
+    match c.try_tag(tag)? {
+        Some(inner) => Ok(Some(parse_dec(inner)?)),
+        None => Ok(None),
+    }
 }
 
 fn parse_tag_hex(c: &mut Cursor, tag: &str) -> Result<u32, AsmError> {

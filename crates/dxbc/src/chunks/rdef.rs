@@ -189,7 +189,13 @@ impl ResourceInputType {
     }
 }
 
-/// Resource dimension (D3D_SRV_DIMENSION).
+/// Resource dimension (`D3D_SRV_DIMENSION`).
+///
+/// NOTE: this enum's numbering is **not** the same as the shader-bytecode
+/// resource-dimension enum (`D3D10_SB_RESOURCE_DIMENSION`) used by `dcl_resource`
+/// in the SHEX chunk — e.g. SRV `Texture2DArray` is 5 here but 8 there. The RDEF
+/// binding's dimension field is an SRV dimension, so it must be decoded with
+/// this table; mixing the two mislabels every texture.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[repr(u32)]
 pub enum ResourceDimension {
@@ -197,20 +203,20 @@ pub enum ResourceDimension {
     Buffer = 1,
     /// 1D texture.
     Texture1D = 2,
-    /// 2D texture.
-    Texture2D = 3,
-    /// 2D multisampled texture.
-    Texture2DMS = 4,
-    /// 3D (volume) texture.
-    Texture3D = 5,
-    /// Cube-map texture.
-    TextureCube = 6,
     /// 1D texture array.
-    Texture1DArray = 7,
+    Texture1DArray = 3,
+    /// 2D texture.
+    Texture2D = 4,
     /// 2D texture array.
-    Texture2DArray = 8,
+    Texture2DArray = 5,
+    /// 2D multisampled texture.
+    Texture2DMS = 6,
     /// 2D multisampled texture array.
-    Texture2DMSArray = 9,
+    Texture2DMSArray = 7,
+    /// 3D (volume) texture.
+    Texture3D = 8,
+    /// Cube-map texture.
+    TextureCube = 9,
     /// Cube-map texture array.
     TextureCubeArray = 10,
 }
@@ -221,13 +227,13 @@ impl ResourceDimension {
         Some(match v {
             1 => Self::Buffer,
             2 => Self::Texture1D,
-            3 => Self::Texture2D,
-            4 => Self::Texture2DMS,
-            5 => Self::Texture3D,
-            6 => Self::TextureCube,
-            7 => Self::Texture1DArray,
-            8 => Self::Texture2DArray,
-            9 => Self::Texture2DMSArray,
+            3 => Self::Texture1DArray,
+            4 => Self::Texture2D,
+            5 => Self::Texture2DArray,
+            6 => Self::Texture2DMS,
+            7 => Self::Texture2DMSArray,
+            8 => Self::Texture3D,
+            9 => Self::TextureCube,
             10 => Self::TextureCubeArray,
             _ => return None,
         })
@@ -238,28 +244,76 @@ impl ResourceDimension {
         match self {
             Self::Buffer => "buf",
             Self::Texture1D => "1d",
+            Self::Texture1DArray => "1darray",
             Self::Texture2D => "2d",
+            Self::Texture2DArray => "2darray",
             Self::Texture2DMS => "2dMS",
+            Self::Texture2DMSArray => "2dMSarray",
             Self::Texture3D => "3d",
             Self::TextureCube => "cube",
-            Self::Texture1DArray => "1darray",
-            Self::Texture2DArray => "2darray",
-            Self::Texture2DMSArray => "2dMSarray",
             Self::TextureCubeArray => "cubearray",
         }
     }
+
+    /// The HLSL type stem for this dimension (`Texture2DArray`, etc.). Used when
+    /// reconstructing editable resource declarations.
+    pub fn hlsl_stem(self) -> &'static str {
+        match self {
+            Self::Buffer => "Buffer",
+            Self::Texture1D => "Texture1D",
+            Self::Texture1DArray => "Texture1DArray",
+            Self::Texture2D => "Texture2D",
+            Self::Texture2DArray => "Texture2DArray",
+            Self::Texture2DMS => "Texture2DMS",
+            Self::Texture2DMSArray => "Texture2DMSArray",
+            Self::Texture3D => "Texture3D",
+            Self::TextureCube => "TextureCube",
+            Self::TextureCubeArray => "TextureCubeArray",
+        }
+    }
+
+    /// Inverse of [`hlsl_stem`](Self::hlsl_stem).
+    pub fn from_hlsl_stem(s: &str) -> Option<Self> {
+        Some(match s {
+            "Buffer" => Self::Buffer,
+            "Texture1D" => Self::Texture1D,
+            "Texture1DArray" => Self::Texture1DArray,
+            "Texture2D" => Self::Texture2D,
+            "Texture2DArray" => Self::Texture2DArray,
+            "Texture2DMS" => Self::Texture2DMS,
+            "Texture2DMSArray" => Self::Texture2DMSArray,
+            "Texture3D" => Self::Texture3D,
+            "TextureCube" => Self::TextureCube,
+            "TextureCubeArray" => Self::TextureCubeArray,
+            _ => return None,
+        })
+    }
 }
 
-/// Binding was explicitly packed by the user.
-pub const BIND_FLAG_USER_PACKED: u32 = 0x1;
-/// Binding is actually used by the shader.
-pub const BIND_FLAG_USED: u32 = 0x2;
-/// Sampler is a comparison sampler.
-pub const BIND_FLAG_COMPARISON_SAMPLER: u32 = 0x4;
-/// Texture component flag bit 0.
-pub const BIND_FLAG_TEX_COMP_0: u32 = 0x8;
-/// Texture component flag bit 1.
-pub const BIND_FLAG_TEX_COMP_1: u32 = 0x10;
+// ---------------------------------------------------------------------------
+// Binding flags.
+//
+// Two distinct fields in RDEF carry "flags" with *different* bit meanings; keep
+// them apart to avoid the historical mix-up.
+// ---------------------------------------------------------------------------
+
+/// `D3D_SHADER_INPUT_FLAGS` — the flags field of a *resource binding*.
+pub const SIF_USER_PACKED: u32 = 0x1;
+/// Binding is a comparison sampler.
+pub const SIF_COMPARISON_SAMPLER: u32 = 0x2;
+/// Texture return-component bit 0. Together with bit 1 encodes (components − 1).
+pub const SIF_TEXTURE_COMPONENT_0: u32 = 0x4;
+/// Texture return-component bit 1.
+pub const SIF_TEXTURE_COMPONENT_1: u32 = 0x8;
+/// Both texture-component bits set → a 4-component return type.
+pub const SIF_TEX_COMPONENTS: u32 = SIF_TEXTURE_COMPONENT_0 | SIF_TEXTURE_COMPONENT_1;
+/// Binding is declared but not used by the shader.
+pub const SIF_UNUSED: u32 = 0x10;
+
+/// `D3D_SHADER_VARIABLE_FLAGS::D3D_SVF_USED` — a *cbuffer variable* is read by
+/// the shader. This is a different field from the binding flags above (where bit
+/// `0x2` instead means `comparisonSampler`).
+pub const SVF_USED: u32 = 0x2;
 
 /// Sentinel value for unused texture/sampler start slots.
 pub const SLOT_UNUSED: u32 = 0xFFFFFFFF;
@@ -281,7 +335,8 @@ pub struct ResourceBinding<'a> {
     pub bind_point: u32,
     /// Number of contiguous registers bound.
     pub bind_count: u32,
-    /// Binding flags (userPacked, used, comparisonSampler, …).
+    /// Binding flags (`D3D_SHADER_INPUT_FLAGS`: userPacked, comparisonSampler,
+    /// texComp0/1, unused).
     pub flags: u32,
 }
 
@@ -305,11 +360,11 @@ impl ResourceBinding<'_> {
             return Ok(());
         }
         let parts: &[(&str, u32)] = &[
-            ("userPacked", BIND_FLAG_USER_PACKED),
-            ("used", BIND_FLAG_USED),
-            ("comparisonSampler", BIND_FLAG_COMPARISON_SAMPLER),
-            ("texComp0", BIND_FLAG_TEX_COMP_0),
-            ("texComp1", BIND_FLAG_TEX_COMP_1),
+            ("userPacked", SIF_USER_PACKED),
+            ("comparisonSampler", SIF_COMPARISON_SAMPLER),
+            ("texComp0", SIF_TEXTURE_COMPONENT_0),
+            ("texComp1", SIF_TEXTURE_COMPONENT_1),
+            ("unused", SIF_UNUSED),
         ];
         let mut first = true;
         let mut matched = false;
@@ -985,268 +1040,56 @@ impl ChunkWriter for ResourceDef<'_> {
 /// Serialize an RDEF to editable `key=value` text. Returns `None` for RDEFs
 /// with struct members, whose byte-exact layout is not yet reproduced (those
 /// stay raw hex via the container's emit-time verification).
-pub fn rdef_to_text(rd: &ResourceDef<'_>) -> Option<alloc::string::String> {
-    use core::fmt::Write as _;
+#[cfg(test)]
+mod tests {
+    use super::*;
 
-    fn write_type(o: &mut alloc::string::String, t: &TypeDesc<'_>) {
-        let _ = write!(
-            o,
-            " class={} base={} rows={} cols={} elements={}",
-            t.class, t.var_type, t.rows, t.columns, t.elements
-        );
-        if !t.name.is_empty() {
-            let _ = write!(o, " typename={}", t.name);
-        }
-        if let Some(e) = &t.sm5_extra {
-            let _ = write!(o, " sm5={:x},{:x},{:x},{:x}", e[0], e[1], e[2], e[3]);
-        }
-    }
-
-    // Nested struct members (a member whose own type has members) are not yet
-    // supported by the text codec; defer those RDEFs to raw hex.
-    for cb in &rd.constant_buffers {
-        for v in &cb.variables {
-            for m in &v.var_type.members {
-                if !m.member_type.members.is_empty() {
-                    return None;
-                }
-            }
+    fn binding(dimension: u32, flags: u32) -> ResourceBinding<'static> {
+        ResourceBinding {
+            name: Cow::Borrowed("t"),
+            input_type: 2, // texture
+            return_type: 5,
+            dimension,
+            num_samples: 0,
+            bind_point: 0,
+            bind_count: 1,
+            flags,
         }
     }
 
-    let mut o = alloc::string::String::new();
-    let _ = writeln!(o, "version {:08x}", rd.target_version);
-    let _ = writeln!(o, "flags {:x}", rd.compile_flags);
-    let _ = writeln!(o, "creator {}", rd.creator);
-    if let Some(rd11) = &rd.rd11_extra {
-        let _ = write!(o, "rd11");
-        for x in rd11 {
-            let _ = write!(o, " {x:x}");
-        }
-        let _ = writeln!(o);
-    }
-    for b in &rd.bindings {
-        let _ = writeln!(
-            o,
-            "binding {} input={} return={} dim={} samples={} slot={} count={} flags={:x}",
-            b.name,
-            b.input_type,
-            b.return_type,
-            b.dimension,
-            b.num_samples,
-            b.bind_point,
-            b.bind_count,
-            b.flags
-        );
-    }
-    for cb in &rd.constant_buffers {
-        let _ = writeln!(
-            o,
-            "cbuffer {} size={} flags={:x} kind={}",
-            cb.name, cb.size, cb.flags, cb.cb_type
-        );
-        for v in &cb.variables {
-            let _ = write!(
-                o,
-                "  var {} offset={} size={} flags={:x}",
-                v.name, v.offset, v.size, v.flags
-            );
-            write_type(&mut o, &v.var_type);
-            if let Some(ts) = v.texture_start {
-                let _ = write!(o, " tex={},{}", ts as i32, v.texture_size.unwrap_or(0));
-            }
-            if let Some(ss) = v.sampler_start {
-                let _ = write!(o, " samp={},{}", ss as i32, v.sampler_size.unwrap_or(0));
-            }
-            if !v.default_value.is_empty() {
-                let _ = write!(o, " default=");
-                for byte in v.default_value.iter() {
-                    let _ = write!(o, "{byte:02x}");
-                }
-            }
-            let _ = writeln!(o);
-            for m in &v.var_type.members {
-                let _ = write!(o, "    member {} offset={}", m.name, m.offset);
-                write_type(&mut o, &m.member_type);
-                let _ = writeln!(o);
-            }
-        }
-    }
-    Some(o)
-}
-
-/// Parse the text produced by [`rdef_to_text`] back into an owned RDEF.
-pub fn rdef_from_text(text: &str) -> Option<ResourceDef<'static>> {
-    use alloc::collections::BTreeMap;
-    use alloc::string::String;
-
-    fn kv<'a>(it: impl Iterator<Item = &'a str>) -> BTreeMap<&'a str, &'a str> {
-        let mut m = BTreeMap::new();
-        for tok in it {
-            if let Some((k, val)) = tok.split_once('=') {
-                m.insert(k, val);
-            }
-        }
-        m
-    }
-    fn dec(m: &BTreeMap<&str, &str>, k: &str) -> Option<u32> {
-        m.get(k)?.parse().ok()
-    }
-    fn hexv(m: &BTreeMap<&str, &str>, k: &str) -> Option<u32> {
-        u32::from_str_radix(m.get(k)?, 16).ok()
-    }
-    fn hex_bytes(h: &str) -> Option<Vec<u8>> {
-        if h.len() % 2 != 0 {
-            return None;
-        }
-        let b = h.as_bytes();
-        let mut out = Vec::with_capacity(h.len() / 2);
-        let mut i = 0;
-        while i < b.len() {
-            let hi = (b[i] as char).to_digit(16)?;
-            let lo = (b[i + 1] as char).to_digit(16)?;
-            out.push((hi * 16 + lo) as u8);
-            i += 2;
-        }
-        Some(out)
-    }
-    fn parse_type(m: &BTreeMap<&str, &str>) -> Option<TypeDesc<'static>> {
-        let sm5_extra = match m.get("sm5") {
-            Some(s) => {
-                let mut it = s.split(',');
-                let mut a = [0u32; 4];
-                for slot in &mut a {
-                    *slot = u32::from_str_radix(it.next()?, 16).ok()?;
-                }
-                Some(a)
-            }
-            None => None,
-        };
-        Some(TypeDesc {
-            class: dec(m, "class")? as u16,
-            var_type: dec(m, "base")? as u16,
-            rows: dec(m, "rows")? as u16,
-            columns: dec(m, "cols")? as u16,
-            elements: dec(m, "elements")? as u16,
-            members: Vec::new(),
-            sm5_extra,
-            name: match m.get("typename") {
-                Some(s) => Cow::Owned(String::from(*s)),
-                None => Cow::Borrowed(""),
-            },
-        })
+    #[test]
+    fn srv_dimension_numbering() {
+        // The RDEF binding dimension is a D3D_SRV_DIMENSION, which numbers
+        // Texture2D=4, Texture2DArray=5, Texture2DMS=6, Texture3D=8 — distinct
+        // from the SHEX (SB) enum. Regression for the SB/SRV mix-up.
+        assert_eq!(ResourceDimension::from_u32(4).unwrap().name(), "2d");
+        assert_eq!(ResourceDimension::from_u32(5).unwrap().name(), "2darray");
+        assert_eq!(ResourceDimension::from_u32(6).unwrap().name(), "2dMS");
+        assert_eq!(ResourceDimension::from_u32(8).unwrap().name(), "3d");
     }
 
-    let mut rd = ResourceDef {
-        constant_buffers: Vec::new(),
-        bindings: Vec::new(),
-        creator: Cow::Owned(String::new()),
-        target_version: 0,
-        compile_flags: 0,
-        rd11_extra: None,
-    };
-
-    for line in text.lines() {
-        let line = line.trim();
-        if line.is_empty() {
-            continue;
+    #[test]
+    fn hlsl_stem_roundtrips() {
+        for v in 1..=10 {
+            let d = ResourceDimension::from_u32(v).unwrap();
+            assert_eq!(ResourceDimension::from_hlsl_stem(d.hlsl_stem()), Some(d));
+            assert_eq!(d as u32, v);
         }
-        let (head, rest) = line.split_once(' ').unwrap_or((line, ""));
-        match head {
-            "version" => rd.target_version = u32::from_str_radix(rest.trim(), 16).ok()?,
-            "flags" => rd.compile_flags = u32::from_str_radix(rest.trim(), 16).ok()?,
-            "creator" => rd.creator = Cow::Owned(String::from(rest)),
-            "rd11" => {
-                let mut a = [0u32; 8];
-                let mut it = rest.split_whitespace();
-                for slot in &mut a {
-                    *slot = u32::from_str_radix(it.next()?, 16).ok()?;
-                }
-                rd.rd11_extra = Some(a);
-            }
-            "binding" => {
-                let mut f = rest.split_whitespace();
-                let name = f.next()?;
-                let m = kv(f);
-                rd.bindings.push(ResourceBinding {
-                    name: Cow::Owned(String::from(name)),
-                    input_type: dec(&m, "input")?,
-                    return_type: dec(&m, "return")?,
-                    dimension: dec(&m, "dim")?,
-                    num_samples: dec(&m, "samples")?,
-                    bind_point: dec(&m, "slot")?,
-                    bind_count: dec(&m, "count")?,
-                    flags: hexv(&m, "flags")?,
-                });
-            }
-            "cbuffer" => {
-                let mut f = rest.split_whitespace();
-                let name = f.next()?;
-                let m = kv(f);
-                rd.constant_buffers.push(CBufferDef {
-                    name: Cow::Owned(String::from(name)),
-                    variables: Vec::new(),
-                    size: dec(&m, "size")?,
-                    flags: hexv(&m, "flags")?,
-                    cb_type: dec(&m, "kind")?,
-                });
-            }
-            "member" => {
-                let mut f = rest.split_whitespace();
-                let name = f.next()?;
-                let m = kv(f);
-                let member_type = parse_type(&m)?;
-                let offset = dec(&m, "offset")?;
-                let var = rd.constant_buffers.last_mut()?.variables.last_mut()?;
-                var.var_type.members.push(MemberDesc {
-                    name: Cow::Owned(String::from(name)),
-                    member_type,
-                    offset,
-                });
-            }
-            "var" => {
-                let mut f = rest.split_whitespace();
-                let name = f.next()?;
-                let m = kv(f);
-                let pair = |s: &str| -> Option<(u32, u32)> {
-                    let (a, b) = s.split_once(',')?;
-                    Some((a.parse::<i32>().ok()? as u32, b.parse().ok()?))
-                };
-                let (ts, tz) = match m.get("tex") {
-                    Some(s) => {
-                        let (a, b) = pair(s)?;
-                        (Some(a), Some(b))
-                    }
-                    None => (None, None),
-                };
-                let (ss, sz) = match m.get("samp") {
-                    Some(s) => {
-                        let (a, b) = pair(s)?;
-                        (Some(a), Some(b))
-                    }
-                    None => (None, None),
-                };
-                let default = match m.get("default") {
-                    Some(h) => hex_bytes(h)?,
-                    None => Vec::new(),
-                };
-                let var_type = parse_type(&m)?;
-                let cb = rd.constant_buffers.last_mut()?;
-                cb.variables.push(CBufferVariable {
-                    name: Cow::Owned(String::from(name)),
-                    offset: dec(&m, "offset")?,
-                    size: dec(&m, "size")?,
-                    flags: hexv(&m, "flags")?,
-                    var_type,
-                    default_value: Cow::Owned(default),
-                    texture_start: ts,
-                    texture_size: tz,
-                    sampler_start: ss,
-                    sampler_size: sz,
-                });
-            }
-            _ => return None,
-        }
+        assert_eq!(ResourceDimension::from_u32(5).unwrap().hlsl_stem(), "Texture2DArray");
+        assert_eq!(ResourceDimension::from_u32(8).unwrap().hlsl_stem(), "Texture3D");
     }
-    Some(rd)
+
+    #[test]
+    fn binding_flags_are_input_flags() {
+        // A plain float4 texture has flags 0xC = TEXTURE_COMPONENT_0|_1. It must
+        // render as the component bits, never as `comparisonSampler` (the old
+        // table had a bogus `used` bit that shifted everything up one).
+        let s = alloc::format!("{}", binding(4, SIF_TEX_COMPONENTS));
+        assert!(s.contains("texComp0;texComp1"), "got: {s}");
+        assert!(!s.contains("comparisonSampler"), "got: {s}");
+
+        let cmp = alloc::format!("{}", binding(4, SIF_COMPARISON_SAMPLER));
+        assert!(cmp.contains("comparisonSampler"), "got: {cmp}");
+        assert!(!cmp.contains("texComp"), "got: {cmp}");
+    }
 }

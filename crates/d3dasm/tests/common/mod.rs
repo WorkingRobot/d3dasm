@@ -5,9 +5,10 @@
 
 #![allow(dead_code)]
 
+use d3dasm::{assemble, serialize};
 use dxbc::shex::{
     ComponentSelect, Indices, Instruction, InstructionKind, Opcode, Operand, OperandIndex, Program,
-    RegisterType, assemble, decode, encode, serialize,
+    RegisterType, decode, encode,
 };
 use smallvec::{SmallVec, smallvec};
 

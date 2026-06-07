@@ -3,7 +3,7 @@
 //!
 //! Layout (after the `//` forensic header, which is ignored on parse):
 //! ```text
-//! .dxbc version=1 hash=<32 hex>
+//! .dxbc version=1      ; header hash is recomputed on reassembly, not stored here
 //! .code SHEX            ; editable shader program (lossless disassembly body)
 //! ps_5_0
 //! ...
@@ -11,6 +11,8 @@
 //!   0a0b0c...
 //! .end
 //! ```
+//!
+//! See `docs/d3dasm-grammar.md` for the full text-format grammar.
 //! `.code <fourcc>` bodies are assembled via [`dxbc::shex::assemble`] and
 //! re-encoded; `.chunk <fourcc>` bodies are raw hex. The container is rebuilt
 //! with [`dxbc::container::build_dxbc_with_header`], preserving the original
@@ -21,7 +23,7 @@ use alloc::string::String;
 use alloc::vec::Vec;
 use core::fmt::Write;
 
-use dxbc::AsmError;
+use crate::AsmError;
 use dxbc::chunks::WritableChunk;
 use dxbc::shex::Program;
 
@@ -80,7 +82,7 @@ const SIGNATURE_FOURCCS: &[&[u8; 4]] = &[
 fn encode_to_text(fourcc: [u8; 4], data: &[u8], program: Option<&Program>) -> Option<String> {
     if &fourcc == b"SHEX" || &fourcc == b"SHDR" {
         let program = dxbc::shex::decode_with_fourcc(data, fourcc).ok()?;
-        return Some(dxbc::shex::serialize(&program));
+        return Some(crate::grammar::shex::serialize(&program));
     }
     if SIGNATURE_FOURCCS.contains(&&fourcc) {
         let fs = core::str::from_utf8(&fourcc).ok()?;
@@ -88,25 +90,25 @@ fn encode_to_text(fourcc: [u8; 4], data: &[u8], program: Option<&Program>) -> Op
             fourcc,
             elements: dxbc::chunks::signature::parse_signature(fs, data),
         };
-        return Some(dxbc::chunks::signature::signature_to_text(&sig));
+        return Some(crate::grammar::signature::signature_to_text(&sig));
     }
     if &fourcc == b"STAT" {
         let stats = dxbc::chunks::stat::parse_stat(data)?;
-        return Some(dxbc::chunks::stat::stat_to_text(&stats));
+        return Some(crate::grammar::stat::stat_to_text(&stats));
     }
     if &fourcc == b"RDEF" {
         let rd = dxbc::chunks::rdef::parse_rdef(data)?;
         // Prefer the HLSL reconstruction when it round-trips byte-exactly;
         // otherwise the explicit key=value form (also lossless).
-        if let Some(hlsl) = dxbc::chunks::rdef_hlsl::rdef_to_hlsl(&rd, program)
-            && let Some(rd2) = dxbc::chunks::rdef_hlsl::rdef_from_hlsl(&hlsl, program)
+        if let Some(hlsl) = crate::grammar::rdef::hlsl::rdef_to_hlsl(&rd, program)
+            && let Some(rd2) = crate::grammar::rdef::hlsl::rdef_from_hlsl(&hlsl, program)
         {
             use dxbc::chunks::ChunkWriter;
             if rd2.to_writable().data == data {
                 return Some(hlsl);
             }
         }
-        return dxbc::chunks::rdef::rdef_to_text(&rd);
+        return crate::grammar::rdef::rdef_to_text(&rd);
     }
     None
 }
@@ -118,18 +120,18 @@ fn body_to_chunk(
     program: Option<&Program>,
 ) -> Result<Vec<u8>, AsmError> {
     if &fourcc == b"SHEX" || &fourcc == b"SHDR" {
-        let program = dxbc::shex::assemble(body)?;
+        let program = crate::grammar::shex::parse(body)?;
         return Ok(dxbc::shex::encode(&program));
     }
     if SIGNATURE_FOURCCS.contains(&&fourcc) {
-        let sig = dxbc::chunks::signature::signature_from_text(fourcc, body)
+        let sig = crate::grammar::signature::signature_from_text(fourcc, body)
             .ok_or_else(|| err("malformed signature text"))?;
         return Ok(dxbc::chunks::signature::write_signature(fourcc, &sig.elements).data);
     }
     if &fourcc == b"STAT" {
         use dxbc::chunks::ChunkWriter;
         let stats =
-            dxbc::chunks::stat::stat_from_text(body).ok_or_else(|| err("malformed stat text"))?;
+            crate::grammar::stat::stat_from_text(body).ok_or_else(|| err("malformed stat text"))?;
         return Ok(stats.to_writable().data);
     }
     if &fourcc == b"RDEF" {
@@ -141,10 +143,10 @@ fn body_to_chunk(
             .find(|l| !l.is_empty())
             .is_some_and(|l| l.starts_with("target"));
         let rd = if is_hlsl {
-            dxbc::chunks::rdef_hlsl::rdef_from_hlsl(body, program)
+            crate::grammar::rdef::hlsl::rdef_from_hlsl(body, program)
                 .ok_or_else(|| err("malformed rdef hlsl"))?
         } else {
-            dxbc::chunks::rdef::rdef_from_text(body).ok_or_else(|| err("malformed rdef text"))?
+            crate::grammar::rdef::rdef_from_text(body).ok_or_else(|| err("malformed rdef text"))?
         };
         return Ok(rd.to_writable().data);
     }
@@ -184,7 +186,7 @@ fn assemble_program(lines: &[&str], start: usize) -> Option<Program> {
                     body.push('\n');
                     j += 1;
                 }
-                return dxbc::shex::assemble(&body).ok();
+                return crate::grammar::shex::parse(&body).ok();
             }
         }
         i += 1;

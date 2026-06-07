@@ -41,6 +41,14 @@ pub use dxbc;
 /// reassembly of an entire DXBC container.
 pub mod container_doc;
 mod forensic;
+/// The `.d3dasm` text grammar — per-chunk serialize/parse codecs.
+pub mod grammar;
+
+/// Serialize a shader [`dxbc::Program`] to lossless `.d3dasm` text, and parse it
+/// back. These mirror the old `dxbc::{serialize,assemble}` entry points, which
+/// now live here alongside the rest of the `.d3dasm` grammar.
+pub use grammar::shex::{AsmError, serialize};
+pub use grammar::shex::parse as assemble;
 
 /// A parsed DXBC shader container with typed chunk access and formatting.
 ///

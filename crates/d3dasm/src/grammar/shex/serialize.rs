@@ -1,7 +1,7 @@
 //! Lossless serializer: [`Program`] -> `.d3dasm` text.
 //!
 //! Inverse of [`super::parse::parse`]. See the [module docs](super) for the
-//! grammar. Every field the [encoder](crate::shex::encode) reads is emitted;
+//! grammar. Every field the `dxbc::shex` encoder reads is emitted;
 //! instruction-level modifier fields are emitted only for `Generic`/`HsPhase`
 //! kinds, the only kinds whose modifiers the encoder consumes.
 
@@ -9,9 +9,8 @@ use alloc::string::String;
 use core::fmt::Write;
 
 use super::{AXES, DIMENSIONS, name_of};
-use crate::shex::fmt::{ImmediateType, opcode_imm_type};
-use crate::shex::ir::*;
-use crate::shex::opcodes::Opcode;
+use dxbc::shex::{ImmediateType, opcode_imm_type};
+use dxbc::shex::*;
 
 /// Serialize a [`Program`] into lossless `.d3dasm` text.
 pub fn serialize(program: &Program) -> String {
@@ -189,9 +188,16 @@ fn write_operand(w: &mut String, op: &Operand, imm_type: ImmediateType) {
             write_indices(w, &op.indices);
         }
     }
-    // A scalar immediate's 1-component selection (`.1`) is implied — omit it
-    // (the parser restores it for any bare inline immediate).
-    if !(inline_imm && matches!(op.components, ComponentSelect::OneComponent)) {
+    // An inline immediate's component selection is implied by its value count:
+    // scalar literals are 1-component (`.1`), vector literals are 4-component
+    // mask-mode with an empty mask (`:`). Both are redundant, so omit them — the
+    // parser restores the right one from the value count.
+    let redundant_imm_select = inline_imm
+        && matches!(
+            op.components,
+            ComponentSelect::OneComponent | ComponentSelect::Mask(0)
+        );
+    if !redundant_imm_select {
         write_components(w, &op.components);
     }
     if op.abs {
@@ -349,7 +355,13 @@ fn write_declaration(w: &mut String, instr: &Instruction) -> core::fmt::Result {
             write!(w, " {dimension} ")?;
             write_return_types(w, return_type);
             write_op0(w, operands);
-            write!(w, " samples({sample_count})")?;
+            // The sample count is only meaningful for multisampled resources;
+            // fxc shows it there (even when 0) and omits it otherwise. Keep a
+            // non-zero count regardless so any input round-trips.
+            let is_ms = matches!(*dimension, "texture2dms" | "texture2dmsarray");
+            if is_ms || *sample_count != 0 {
+                write!(w, " samples({sample_count})")?;
+            }
         }
         InstructionKind::DclSampler { mode, operands } => {
             write_op0(w, operands);

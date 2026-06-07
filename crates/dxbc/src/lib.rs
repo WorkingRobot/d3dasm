@@ -35,9 +35,9 @@
 //!   `fxc.exe`-compatible disassembly output.
 //! * **Encode** — `shex::encode` serialises a `Program` back to
 //!   bytes, enabling shader modification and round-trip workflows.
-//! * **Assemble** — `shex::serialize` writes a `Program` as lossless `.d3dasm`
-//!   text, and `shex::assemble` parses it back, so a `.d3dasm` file re-encodes
-//!   to byte-identical bytecode.
+//!
+//! The lossless `.d3dasm` *text* grammar (serialize/parse) lives in the
+//! `d3dasm` crate (`d3dasm::grammar`), built on this crate's IR.
 
 #![no_std]
 extern crate alloc;
@@ -58,4 +58,3 @@ pub use chunks::ChunkData;
 pub use container::{DxbcChunk, DxbcContainer, build_dxbc, scan_dxbc};
 pub use shex::Program;
 pub use shex::disassemble;
-pub use shex::{AsmError, assemble, serialize};

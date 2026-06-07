@@ -5,11 +5,11 @@ use alloc::string::String;
 use core::fmt::Write as _;
 
 use super::*;
-use crate::chunks::ChunkWriter;
-use crate::chunks::rdef::{
-    BIND_FLAG_USED, CBufferDef, CBufferVariable, ResourceBinding, ResourceDef, SLOT_UNUSED,
+use dxbc::chunks::ChunkWriter;
+use dxbc::chunks::rdef::{
+    CBufferDef, CBufferVariable, ResourceBinding, ResourceDef, SLOT_UNUSED, SVF_USED,
 };
-use crate::shex::Program;
+use dxbc::shex::Program;
 
 fn emit_binding(o: &mut String, b: &ResourceBinding<'_>, rd: &ResourceDef<'_>) -> Option<()> {
     let (spec, reg) = binding_typespec(b, rd)?;
@@ -73,12 +73,12 @@ fn emit_var(
     // The `used` flag is derived from the program when available; tag the
     // variable only when the stored flags differ from that derivation.
     let baseline = match cb_reads {
-        Some(r) if var_used(r, v.offset, v.size) => BIND_FLAG_USED,
+        Some(r) if var_used(r, v.offset, v.size) => SVF_USED,
         Some(_) => 0,
         None => 0,
     };
     if v.flags != baseline {
-        if v.flags == BIND_FLAG_USED {
+        if v.flags == SVF_USED {
             o.push_str(" used");
         } else if v.flags == 0 {
             o.push_str(" unused");

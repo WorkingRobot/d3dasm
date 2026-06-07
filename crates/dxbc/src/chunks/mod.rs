@@ -16,7 +16,6 @@ pub mod priv_;
 pub mod psv0;
 pub mod rdat;
 pub mod rdef;
-pub mod rdef_hlsl;
 pub mod rts0;
 pub mod sfi0;
 pub mod signature;

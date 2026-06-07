@@ -6,9 +6,10 @@
 mod common;
 
 use common::*;
+use d3dasm::{assemble, serialize};
 use dxbc::shex::{
     ComponentSelect, CustomDataType, InstructionKind, Opcode, Operand, OperandIndex, Program,
-    RegisterType, ReturnType, assemble, decode, encode, serialize,
+    RegisterType, ReturnType, decode, encode,
 };
 use smallvec::{SmallVec, smallvec};
 
@@ -439,4 +440,59 @@ fn full_pixel_shader() {
         generic(Opcode::Mov, vec![temp(0, MASK_ALL), temp(1, XYZW)]),
         generic(Opcode::Ret, vec![]),
     ]));
+}
+
+#[test]
+fn vector_immediate_has_no_trailing_colon() {
+    // A 4-component inline immediate decodes to mask-mode with an empty mask.
+    // Its component selection is implied by the value count, so it must serialize
+    // as a bare `l(...)` with no dangling `:` — and still round-trip.
+    let imm = Operand {
+        reg_type: RegisterType::Immediate32,
+        components: ComponentSelect::Mask(0),
+        negate: false,
+        abs: false,
+        indices: SmallVec::new(),
+        immediate_values: smallvec![0x3f80_0000, 0x3f80_0000, 0, 0],
+    };
+    let prog = program(vec![
+        generic(Opcode::Max, vec![temp(0, MASK_ALL), temp(1, XYZW), imm]),
+        generic(Opcode::Ret, vec![]),
+    ]);
+    let canon = decode(&encode(&prog)).unwrap();
+    let text = serialize(&canon);
+    assert!(!text.contains("):"), "stray colon after immediate:\n{text}");
+    rt(&prog);
+}
+
+#[test]
+fn dcl_resource_non_ms_omits_samples() {
+    // A non-multisampled resource must not emit `samples(0)`; a multisampled one
+    // must keep `samples(N)`. Both round-trip.
+    let t = |dim| {
+        let r = reg_op(
+            RegisterType::Resource,
+            ComponentSelect::Swizzle([0, 1, 2, 3]),
+            smallvec![OperandIndex::Imm32(0)],
+        );
+        program(vec![insn(
+            Opcode::DclResource,
+            InstructionKind::DclResource {
+                dimension: dim,
+                sample_count: 0,
+                return_type: [ReturnType::Float; 4],
+                operands: smallvec![r],
+            },
+        )])
+    };
+
+    let tex2d = t("texture2d");
+    let text = serialize(&decode(&encode(&tex2d)).unwrap());
+    assert!(!text.contains("samples("), "non-MS leaked samples:\n{text}");
+    rt(&tex2d);
+
+    let texms = t("texture2dms");
+    let text = serialize(&decode(&encode(&texms)).unwrap());
+    assert!(text.contains("samples(0)"), "MS dropped samples:\n{text}");
+    rt(&texms);
 }

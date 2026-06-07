@@ -103,6 +103,7 @@ name = "d3dasm"
 version = "0.1.0"
 dependencies = [
  "dxbc",
+ "smallvec",
 ]
 
 [[package]]

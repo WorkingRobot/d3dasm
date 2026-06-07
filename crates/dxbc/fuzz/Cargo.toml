@@ -15,6 +15,11 @@ smallvec = { version = "1", features = ["union"] }
 [dependencies.dxbc]
 path = ".."
 
+# The `.d3dasm` text grammar (serialize/assemble) lives in d3dasm; the fuzzer
+# exercises it against dxbc's encode/decode.
+[dependencies.d3dasm]
+path = "../../d3dasm"
+
 [[bin]]
 name = "roundtrip"
 path = "fuzz_targets/roundtrip.rs"

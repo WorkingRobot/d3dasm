@@ -1,11 +1,11 @@
 //! Lossless `.d3dasm` text format: a round-trippable textual encoding of a
-//! [`Program`](super::ir::Program).
+//! `dxbc::shex::Program`.
 //!
-//! Unlike the human-readable disassembly produced by [`super::fmt`] (which
-//! trims swizzles, prettifies immediates, and drops fields the encoder needs),
-//! the `.d3dasm` format is **injective**: [`serialize`] writes every field the
-//! [encoder](super::encode) consumes, and [`parse`] is its inverse. The design
-//! property is:
+//! Unlike the human-readable disassembly produced by `dxbc::shex` `Display`
+//! (which trims swizzles, prettifies immediates, and drops fields the encoder
+//! needs), the `.d3dasm` format is **injective**: [`serialize`] writes every
+//! field the `dxbc::shex` encoder consumes, and [`parse`] is its inverse. The
+//! design property is:
 //!
 //! ```text
 //! bytes -> decode -> serialize -> parse -> encode -> bytes
@@ -36,7 +36,7 @@
 //! components   := ':' letter* | '.1' | '.' letter | '.' letter{4}
 //! ```
 //!
-//! Component encoding is explicit so each [`ComponentSelect`](super::ir::ComponentSelect)
+//! Component encoding is explicit so each `dxbc::shex::ComponentSelect`
 //! variant is distinguishable: `ZeroComponent` -> (none), `OneComponent` -> `.1`,
 //! `Scalar(c)` -> `.<letter>`, `Swizzle(s)` -> `.<4 letters>`, `Mask(m)` ->
 //! `:<letters>` (the `:` marks a write-mask vs a `.` read-swizzle).
@@ -148,7 +148,7 @@ pub(crate) const GLOBAL_FLAGS: &[&str] = &[
 ];
 
 /// Intern `s` to the canonical `&'static str` in a `(name, value)` table.
-pub(crate) fn intern<'a>(table: &[(&'static str, u32)], s: &str) -> Option<&'static str> {
+pub(crate) fn intern(table: &[(&'static str, u32)], s: &str) -> Option<&'static str> {
     table.iter().find(|(n, _)| *n == s).map(|(n, _)| *n)
 }
 

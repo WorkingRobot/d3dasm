@@ -18,3 +18,4 @@ std = ["dxbc/std"]
 
 [dependencies]
 dxbc = { version = "0.1.0", path = "../dxbc" }
+smallvec = { version = "1.15.1", default-features = false, features = ["union"] }

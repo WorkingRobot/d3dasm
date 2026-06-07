@@ -85,8 +85,8 @@ fn container_text_roundtrip() {
         .program()
         .expect("container has a shader program");
 
-    let text = dxbc::serialize(prog);
-    let parsed = dxbc::assemble(&text).unwrap_or_else(|e| panic!("assemble failed: {e}\n{text}"));
+    let text = d3dasm::serialize(prog);
+    let parsed = d3dasm::assemble(&text).unwrap_or_else(|e| panic!("assemble failed: {e}\n{text}"));
     let reencoded = dxbc::shex::encode(&parsed);
 
     assert_eq!(

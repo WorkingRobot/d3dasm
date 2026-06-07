@@ -505,7 +505,7 @@ fn encode_return_type_token(rt: &[ReturnType; 4]) -> u32 {
 }
 
 /// Convert a system value name string back to its `D3D10_SB_NAME` / `D3D11_SB_NAME` value.
-pub(crate) fn system_value_to_u32(name: &str) -> u32 {
+pub fn system_value_to_u32(name: &str) -> u32 {
     match name {
         "undefined" => 0,
         "position" => 1,
