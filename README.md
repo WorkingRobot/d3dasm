@@ -12,6 +12,7 @@ Parses DXBC containers, decodes SM4/SM5 shader bytecode into a fully typed inter
 - **Zero-copy reads, copy-on-write mutation** — Metadata strings and raw blobs borrow directly from the input buffer via `Cow<'a, T>`. Assigning `Cow::Owned(...)` transparently enables shader patching without touching the original data.
 - **Lazy chunk parsing** — Non-program chunks (RDEF, signatures, STAT, etc.) are parsed on first access via `OnceCell`. Callers that only need the shader program pay zero overhead for metadata.
 - **Container scanning** — Automatically finds DXBC containers in arbitrary byte streams (raw files, `fxb0` wrappers, custom game archives).
+- **HLSL recovery** — The `hlsl` crate turns a decoded program back into source that compiles: expressions rebuilt from the register traffic, structured control flow, a struct per constant buffer, and matrix multiplies recovered from their unrolled dot products.
 - **`no_std` core** — The `dxbc` crate uses only `core` and `alloc`, no filesystem or I/O.
 - **All shader stages** — VS, PS, GS, HS, DS, CS.
 
@@ -21,6 +22,7 @@ Parses DXBC containers, decodes SM4/SM5 shader bytecode into a fully typed inter
 | ------------ | -------------- | --------------------------------------------------------------------------------------------- |
 | `dxbc`       | lib (`no_std`) | DXBC container parser/writer, chunk decoders, SM4/SM5 bytecode decode/encode/format           |
 | `d3dasm`     | lib            | High-level disassembly interface — wraps `dxbc` with typed accessors and `Display` formatting |
+| `hlsl`       | lib            | Recovers compilable HLSL source from a decoded SM4/SM5 program                                 |
 | `d3dasm-cli` | bin            | Command-line disassembler                                                                     |
 
 ## Usage
@@ -57,6 +59,19 @@ for chunk in &container.chunks {
         }
         _ => {}
     }
+}
+```
+
+### Back to HLSL via `hlsl`
+
+Disassembly is one instruction per line; the `hlsl` crate rebuilds the expressions instead, and what
+it emits compiles. Register names are not in the bytecode, so whatever knows them supplies an
+`hlsl::Names`; the default is empty and yields `cb0[3].xyz`.
+
+```rust
+let names = hlsl::Names::default();
+for line in hlsl::decompile(&program, &names).lines {
+    println!("{line}");
 }
 ```
 
@@ -111,6 +126,14 @@ d3dasm/
 │   │       └── util.rs              # Shared helpers
 │   ├── d3dasm/                       # High-level disassembly API
 │   │   └── src/lib.rs
+│   ├── hlsl/                         # Bytecode back to HLSL source
+│   │   └── src/
+│   │       ├── lib.rs                # Signature, resource declarations, statements
+│   │       ├── body.rs               # Instructions to expressions, and what to name
+│   │       ├── expr.rs               # Expression tree and how it prints
+│   │       ├── idiom.rs              # Patterns a compiler leaves behind
+│   │       ├── matrix.rs             # Unrolled transforms back to a mul()
+│   │       └── layout.rs             # Constant buffer fields, out of RDEF
 │   └── d3dasm-cli/                   # CLI binary
 │       └── src/main.rs
 ```

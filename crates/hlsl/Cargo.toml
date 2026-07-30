@@ -1,0 +1,16 @@
+[package]
+name = "hlsl"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.85"
+description = "Recovers HLSL source from SM4/SM5 shader bytecode"
+license = "MIT"
+repository = "https://github.com/WorkingRobot/d3dasm"
+homepage = "https://github.com/WorkingRobot/d3dasm"
+authors = ["Asriel Camora <asriel@camora.dev>"]
+keywords = ["dxbc", "directx", "shader", "decompiler", "hlsl"]
+categories = ["parser-implementations", "game-development"]
+readme = "../../README.md"
+
+[dependencies]
+dxbc = { version = "0.1.0", path = "../dxbc" }
