@@ -2,7 +2,6 @@
 name = "d3dasm"
 version = "0.1.0"
 edition = "2024"
-rust-version = "1.85"
 description = "Generic Direct3D shader disassembly interface"
 license = "MIT"
 repository = "https://github.com/coconutbird/d3dasm"

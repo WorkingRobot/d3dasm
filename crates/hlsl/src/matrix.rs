@@ -633,11 +633,256 @@ fn ordered(lines: &[Option<Emitted>], base: &str, members: Vec<usize>) -> Option
 }
 
 /// Rewrite the writes that fill a register between them into the one value they build.
-pub fn coalesce(out: &mut Vec<String>, lines: &[Option<Emitted>]) {
-    let mut drop = vec![false; out.len()];
+/// The source a lane was taken from, and which lane of it, for a write that is a plain slice of
+/// something else. `r1.x = v.x` is one; `r1.x = v.x * 2` is not.
+fn slice(expr: &Expr) -> Option<(String, u8)> {
+    match expr {
+        Expr::Read { base, swizzle } => match swizzle.as_slice() {
+            [only] => Some((base.clone(), *only)),
+            _ => None,
+        },
+        Expr::Swizzle { value, swizzle } => match swizzle.as_slice() {
+            [only] => Some((value.text(), *only)),
+            _ => None,
+        },
+        _ => None,
+    }
+}
+
+/// Consecutive lanes of one register taken from consecutive lanes of one value, written as the one
+/// assignment they are: `r1.x = v.x; r1.y = v.y;` is `r1.xy = v.xy;`.
+///
+/// Only writes that already sit next to each other join, so nothing moves past anything and the
+/// hazards a run has to be checked for do not arise.
+fn sliced(out: &mut [String], lines: &[Option<Emitted>], drop: &mut [bool]) {
     let mut at = 0;
     while at < lines.len() {
-        let Some((group, last)) = whole(lines, at) else {
+        let Some(first) = lines[at].as_ref() else {
+            at += 1;
+            continue;
+        };
+        let Some((source, lane)) = slice(&first.expr).filter(|_| first.lanes.len() == 1) else {
+            at += 1;
+            continue;
+        };
+        let mut pairs = vec![(first.lanes[0], lane)];
+        let mut end = at;
+        for (pos, held) in lines.iter().enumerate().skip(at + 1) {
+            let Some(held) = held.as_ref() else {
+                break;
+            };
+            if held.base != first.base || held.depth != first.depth || held.lanes.len() != 1 {
+                break;
+            }
+            // The value being sliced must not be the register being filled, or a later lane would
+            // read what an earlier one has already put there.
+            match slice(&held.expr) {
+                Some((held_source, held_lane))
+                    if held_source == source
+                        && !reads(&held.expr, &first.base)
+                        && !pairs.iter().any(|(into, _)| *into == held.lanes[0]) =>
+                {
+                    pairs.push((held.lanes[0], held_lane));
+                    end = pos;
+                }
+                _ => break,
+            }
+        }
+        if pairs.len() < 2 || reads(&first.expr, &first.base) {
+            at += 1;
+            continue;
+        }
+        // A write mask names its components in order, so the source lanes follow wherever theirs go.
+        pairs.sort_by_key(|(into, _)| *into);
+        let into: Vec<u8> = pairs.iter().map(|(into, _)| *into).collect();
+        let from: Vec<u8> = pairs.iter().map(|(_, from)| *from).collect();
+        let whole = into.len() == 4 && into == [0, 1, 2, 3];
+        out[at] = format!(
+            "{}{}{} = {};",
+            "    ".repeat(first.depth),
+            first.base,
+            match whole {
+                true => String::new(),
+                false => format!(".{}", letters(&into)),
+            },
+            Expr::Read {
+                base: source,
+                swizzle: from,
+            }
+            .text()
+        );
+        drop[at + 1..=end].fill(true);
+        at = end + 1;
+    }
+}
+
+/// One expression standing for what several lanes each compute, where they compute the same thing
+/// bar one operand: `a.x * c, b.x * c, d.x * c` is `float3(a.x, b.x, d.x) * c`.
+///
+/// The structure has to be tried before the fallback, or the whole of every lane would be gathered
+/// into a constructor and nothing would be shared at all.
+fn lanewise(parts: &[&Expr]) -> Option<Expr> {
+    let first = *parts.first()?;
+    if parts.iter().all(|held| *held == first) {
+        return Some(first.clone());
+    }
+    let alike = |pick: fn(&Expr) -> Option<&Expr>| -> Option<Vec<&Expr>> {
+        parts.iter().map(|held| pick(held)).collect()
+    };
+    let rebuilt = match first {
+        Expr::Binary { op, left, right } => {
+            let ops = parts
+                .iter()
+                .all(|held| matches!(held, Expr::Binary { op: held, .. } if held == op));
+            let (lefts, rights) = match ops {
+                true => (
+                    alike(|held| match held {
+                        Expr::Binary { left, .. } => Some(left.as_ref()),
+                        _ => None,
+                    }),
+                    alike(|held| match held {
+                        Expr::Binary { right, .. } => Some(right.as_ref()),
+                        _ => None,
+                    }),
+                ),
+                false => (None, None),
+            };
+            match (lefts, rights) {
+                (Some(lefts), Some(rights)) => {
+                    let steady = |held: &[&Expr]| held.iter().all(|one| *one == held[0]);
+                    // Two operands differing at once is two things to gather, which is no shorter
+                    // than leaving the lanes as they were.
+                    match (steady(&lefts), steady(&rights)) {
+                        (true, false) => Some(Expr::Binary {
+                            op,
+                            left: left.clone(),
+                            right: Box::new(lanewise(&rights)?),
+                        }),
+                        (false, true) => Some(Expr::Binary {
+                            op,
+                            left: Box::new(lanewise(&lefts)?),
+                            right: right.clone(),
+                        }),
+                        // The compiler writes a commutative pair in whichever order it please, so a
+                        // shared operand can sit on the left of one lane and the right of the next.
+                        _ if matches!(*op, "*" | "+" | "&" | "|" | "^") => [lefts[0], rights[0]]
+                            .into_iter()
+                            .find_map(|shared| {
+                                let varying: Vec<&Expr> = parts
+                                    .iter()
+                                    .filter_map(|held| match held {
+                                        Expr::Binary { left, right, .. }
+                                            if left.as_ref() == shared =>
+                                        {
+                                            Some(right.as_ref())
+                                        }
+                                        Expr::Binary { left, right, .. }
+                                            if right.as_ref() == shared =>
+                                        {
+                                            Some(left.as_ref())
+                                        }
+                                        _ => None,
+                                    })
+                                    .collect();
+                                (varying.len() == parts.len()).then_some((shared, varying))
+                            })
+                            .and_then(|(shared, varying)| {
+                                Some(Expr::Binary {
+                                    op,
+                                    left: Box::new(lanewise(&varying)?),
+                                    right: Box::new(shared.clone()),
+                                })
+                            }),
+                        _ => None,
+                    }
+                }
+                _ => None,
+            }
+        }
+        _ => None,
+    };
+    if let Some(held) = rebuilt {
+        return Some(held);
+    }
+    // Nothing shared, so the lanes are gathered as they are — which only reads as one value where
+    // each of them really is one component.
+    match parts.iter().all(|held| held.components() == 1) {
+        true => Some(call(
+            &format!("float{}", parts.len()),
+            parts.iter().map(|held| (*held).clone()).collect(),
+            parts.len(),
+        )),
+        false => None,
+    }
+}
+
+/// Consecutive lanes of a register that compute the same thing bar one operand, written as one
+/// assignment.
+fn gathered(out: &mut [String], lines: &[Option<Emitted>], drop: &mut [bool]) {
+    let mut at = 0;
+    while at < lines.len() {
+        let Some(first) = lines[at].as_ref().filter(|held| held.lanes.len() == 1) else {
+            at += 1;
+            continue;
+        };
+        if drop[at] {
+            at += 1;
+            continue;
+        }
+        let mut into = vec![first.lanes[0]];
+        let mut end = at;
+        for (pos, held) in lines.iter().enumerate().skip(at + 1) {
+            let Some(held) = held.as_ref() else {
+                break;
+            };
+            if drop[pos]
+                || held.base != first.base
+                || held.depth != first.depth
+                || held.lanes.len() != 1
+                || into.contains(&held.lanes[0])
+                || reads(&held.expr, &first.base)
+            {
+                break;
+            }
+            into.push(held.lanes[0]);
+            end = pos;
+        }
+        if into.len() < 2 || reads(&first.expr, &first.base) {
+            at += 1;
+            continue;
+        }
+        let parts: Vec<&Expr> = (at..=end)
+            .map(|line| &lines[line].as_ref().expect("checked above").expr)
+            .collect();
+        let Some(held) = lanewise(&parts) else {
+            at += 1;
+            continue;
+        };
+        let whole = into.len() == 4 && into == [0, 1, 2, 3];
+        out[at] = format!(
+            "{}{}{} = {};",
+            "    ".repeat(first.depth),
+            first.base,
+            match whole {
+                true => String::new(),
+                false => format!(".{}", letters(&into)),
+            },
+            held.text()
+        );
+        drop[at + 1..=end].fill(true);
+        at = end + 1;
+    }
+}
+
+pub fn coalesce(out: &mut Vec<String>, lines: &[Option<Emitted>]) {
+    let mut drop = vec![false; out.len()];
+    sliced(out, lines, &mut drop);
+    gathered(out, lines, &mut drop);
+    let mut at = 0;
+    while at < lines.len() {
+        let Some((group, last)) =
+            whole(lines, at).filter(|(group, _)| group.iter().all(|line| !drop[*line]))
+        else {
             at += 1;
             continue;
         };
@@ -728,6 +973,64 @@ mod test {
             .collect();
         coalesce(&mut out, &lines);
         out
+    }
+
+    #[test]
+    fn lanes_taken_from_one_value_become_one_write() {
+        let out = joined(vec![
+            part("r1", vec![0], read("v", vec![0])),
+            part("r1", vec![1], read("v", vec![1])),
+        ]);
+        assert_eq!(out, ["    r1.xy = v.xy;"]);
+    }
+
+    /// The components the run did not write still hold whatever put them there, so only a run
+    /// covering the whole register may drop the mask and claim all four.
+    #[test]
+    fn a_partial_fill_leaves_the_rest_of_the_register_alone() {
+        let out = joined(vec![
+            part("r1", vec![0], read("v", vec![0])),
+            part("r1", vec![1], read("v", vec![1])),
+            part("r1", vec![2], read("v", vec![2])),
+        ]);
+        assert_eq!(out, ["    r1.xyz = v.xyz;"]);
+    }
+
+    /// A write mask names its components in order, whatever order they were written in, so the
+    /// source follows.
+    #[test]
+    fn a_run_written_out_of_order_still_pairs_up() {
+        let out = joined(vec![
+            part("r1", vec![1], read("v", vec![2])),
+            part("r1", vec![0], read("v", vec![3])),
+        ]);
+        assert_eq!(out, ["    r1.xy = v.wz;"]);
+    }
+
+    #[test]
+    fn lanes_differing_in_one_operand_gather_into_a_constructor() {
+        let times = |left: Expr, right: Expr| Expr::Binary {
+            op: "*",
+            left: Box::new(left),
+            right: Box::new(right),
+        };
+        let out = joined(vec![
+            part("r1", vec![0], times(read("a", vec![0]), read("c", vec![0]))),
+            part("r1", vec![1], times(read("b", vec![0]), read("c", vec![0]))),
+            part("r1", vec![2], times(read("d", vec![0]), read("c", vec![0]))),
+        ]);
+        assert_eq!(out, ["    r1.xyz = float3(a.x, b.x, d.x) * c.x;"]);
+    }
+
+    /// A lane reading the register the run is filling would see what an earlier lane put there, so
+    /// the run cannot become one assignment.
+    #[test]
+    fn a_lane_reading_what_the_run_writes_is_left_alone() {
+        let out = joined(vec![
+            part("r1", vec![0], read("v", vec![0])),
+            part("r1", vec![1], read("r1", vec![0])),
+        ]);
+        assert_eq!(out, ["    line 0;", "    line 1;"]);
     }
 
     /// A constructor lays its arguments out in component order, which is not always the order the

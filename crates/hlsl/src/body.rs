@@ -402,6 +402,20 @@ fn components(operand: &Operand, lanes: &[u8]) -> Vec<u8> {
     }
 }
 
+/// The lanes an instruction writes, and so how wide it reads its sources.
+///
+/// An opcode with two destinations may discard either to null, which names no lanes of its own. That
+/// has to be spotted by register file: a null operand carries `ZeroComponent`, which `written` reads
+/// as lane x rather than as nothing, so testing for an empty lane set would take the null's word for
+/// it and narrow every source to x. The two destinations never disagree where both are real.
+fn destination_lanes(destinations: &[Operand]) -> Vec<u8> {
+    destinations
+        .iter()
+        .find(|dest| dest.reg_type != RegisterType::Null && !written(dest).is_empty())
+        .map(written)
+        .unwrap_or_default()
+}
+
 /// The destination components an instruction writes, ascending.
 fn written(operand: &Operand) -> Vec<u8> {
     match &operand.components {
@@ -569,23 +583,6 @@ impl<'a> Builder<'a> {
                 if matches!(**then, Expr::Literal { .. }) && matches!(**els, Expr::Literal { .. }))
                 && survives(&self.defs, def, id, usage.last)
         };
-        let folded: Vec<bool> = self
-            .defs
-            .iter()
-            .zip(&self.usage)
-            .enumerate()
-            .map(|(id, (def, usage))| {
-                !def.fixed
-                    && !usage.mixed
-                    && !usage.distant
-                    && !usage.stale
-                    // Nothing reading it does not mean nothing needs it: a branch the walk did not
-                    // follow may be what leaves the register holding this, so a value read nowhere
-                    // still has to be written down.
-                    && usage.reads > 0
-                    && (usage.reads == 1 || repeatable(id, def, usage))
-            })
-            .collect();
         // A register component two blocks both write is one the branch not taken leaves behind, and
         // only the register itself carries that. Anything else names a value one of them never
         // reached.
@@ -604,6 +601,28 @@ impl<'a> Builder<'a> {
                 .iter()
                 .any(|lane| writers.get(&(def.key.0, def.key.1, lane % 4)) == Some(&usize::MAX))
         };
+        let folded: Vec<bool> = self
+            .defs
+            .iter()
+            .zip(&self.usage)
+            .enumerate()
+            .map(|(id, (def, usage))| {
+                !def.fixed
+                    && !usage.mixed
+                    && !usage.distant
+                    && !usage.stale
+                    // Moving it into its reader takes it out of the register, and a later block
+                    // reading that register on the path this one is on would find whatever the
+                    // other writer left. The walk is linear, so it cannot see that the two never
+                    // run together, and so it cannot tell that the value is still wanted.
+                    && !shared(def)
+                    // Nothing reading it does not mean nothing needs it: a branch the walk did not
+                    // follow may be what leaves the register holding this, so a value read nowhere
+                    // still has to be written down.
+                    && usage.reads > 0
+                    && (usage.reads == 1 || repeatable(id, def, usage))
+            })
+            .collect();
         // A value that is not a float costs a reinterpretation going into a register and another
         // coming out, which is noise rather than arithmetic. Given a name of its own it needs
         // neither. Only where every read takes it whole, and none from another block: a name
@@ -774,6 +793,15 @@ impl<'a> Builder<'a> {
             return "true".to_owned();
         };
         let sourced = self.read(&operand, &[0]);
+        // The machine spells an unconditional discard as a test against all-bits-set, which is its
+        // `true`. Left alone that reads as `asfloat(0xffffffffu) != 0.0`, which says nothing.
+        if let Expr::Literal { bits, .. } = &sourced.expr {
+            let held = bits.first().is_some_and(|held| *held != 0);
+            return match held == instruction.test_nonzero {
+                true => "true".to_owned(),
+                false => "false".to_owned(),
+            };
+        }
         let test = coerce(sourced.expr, sourced.domain, Domain::Bool);
         match instruction.test_nonzero {
             true => test.text(),
@@ -815,7 +843,12 @@ impl<'a> Builder<'a> {
                         false => "return".to_owned(),
                     },
                 };
-                self.line(depth, format!("if ({test}) {action};"));
+                // A condition that is always one thing is not a condition.
+                match test.as_str() {
+                    "true" => self.line(depth, format!("{action};")),
+                    "false" => {}
+                    _ => self.line(depth, format!("if ({test}) {action};")),
+                }
             }
             _ => self.assignment(at, depth),
         }
@@ -843,7 +876,7 @@ impl<'a> Builder<'a> {
             return;
         }
 
-        let lanes = written(&operands[0]);
+        let lanes = destination_lanes(&operands[..count]);
         let source_lanes: Vec<u8> = match elementwise(opcode) {
             true => lanes.clone(),
             false => (0..4).collect(),
@@ -1730,8 +1763,13 @@ impl<'a> Builder<'a> {
                             },
                             Some(register) => match self.names.constant(slot, register, comps) {
                                 Some(parts) => gathered(parts),
+                                // A buffer of one register is not an array of anything, and saying
+                                // `[0]` on every read of it only adds noise.
                                 None => Expr::Read {
-                                    base: format!("{name}[{register}]"),
+                                    base: match self.spans.get(&slot) {
+                                        Some(1) => name.clone(),
+                                        _ => format!("{name}[{register}]"),
+                                    },
                                     swizzle: comps.to_vec(),
                                 },
                             },
@@ -1885,6 +1923,109 @@ impl<'a> Builder<'a> {
 #[cfg(test)]
 mod test {
     use super::*;
+
+    fn dest(reg_type: RegisterType, components: ComponentSelect) -> Operand {
+        Operand {
+            reg_type,
+            components,
+            negate: false,
+            abs: false,
+            indices: Default::default(),
+            immediate_values: Default::default(),
+        }
+    }
+
+    // `imul null, r1.xy, r1.xyxx, l(12)` reads two lanes, not one. Taking the first destination
+    // would narrow the sources to x and broadcast it over both, which is valid HLSL and the wrong
+    // shader.
+    #[test]
+    fn a_discarded_destination_does_not_decide_the_lanes() {
+        let null = dest(RegisterType::Null, ComponentSelect::ZeroComponent);
+        let pair = dest(RegisterType::Temp, ComponentSelect::Mask(3));
+        assert_eq!(written(&null), vec![0], "a null still names a lane");
+        assert_eq!(destination_lanes(&[null.clone(), pair.clone()]), vec![0, 1]);
+        assert_eq!(destination_lanes(&[pair, null.clone()]), vec![0, 1]);
+        assert!(destination_lanes(&[null]).is_empty());
+    }
+
+    /// A register two branches both write is one a reader outside them takes from whichever ran, so
+    /// neither write may disappear into its own reader. The walk is linear and sees the second write
+    /// shadowing the first, which on the path through the first branch it does not.
+    ///
+    ///     if (a) { r0.x = v0.x; o0.x = r0.x; }
+    ///     if (b) { r0.x = v1.x; }
+    ///     o1.x = r0.x;
+    #[test]
+    fn a_register_a_second_branch_writes_keeps_both_writes() {
+        let at = |reg_type, register: u32, mask| Operand {
+            reg_type,
+            components: mask,
+            negate: false,
+            abs: false,
+            indices: [OperandIndex::Imm32(register)].into_iter().collect(),
+            immediate_values: Default::default(),
+        };
+        let temp = |mask| at(RegisterType::Temp, 0, mask);
+        let step = |opcode, operands: Vec<Operand>| Instruction {
+            opcode,
+            saturate: false,
+            test_nonzero: true,
+            precise_mask: 0,
+            resinfo_return_type: None,
+            sync_flags: 0,
+            tex_offsets: None,
+            resource_dim: None,
+            resource_return_type: None,
+            kind: InstructionKind::Generic {
+                operands: operands.into_iter().collect(),
+            },
+        };
+        let one = || ComponentSelect::Mask(1);
+        let first = || ComponentSelect::Swizzle([0; 4]);
+        let branch = |input: u32, out: Option<u32>| {
+            let mut held = vec![
+                step(Opcode::If, vec![at(RegisterType::Input, 9, first())]),
+                step(
+                    Opcode::Mov,
+                    vec![temp(one()), at(RegisterType::Input, input, first())],
+                ),
+            ];
+            held.extend(out.map(|slot| {
+                step(
+                    Opcode::Mov,
+                    vec![at(RegisterType::Output, slot, one()), temp(first())],
+                )
+            }));
+            held.push(step(Opcode::EndIf, Vec::new()));
+            held
+        };
+        let program = Program {
+            shader_type: "ps",
+            major_version: 5,
+            minor_version: 0,
+            fourcc: *b"SHEX",
+            warnings: Vec::new(),
+            instructions: [
+                branch(0, Some(0)),
+                branch(1, None),
+                vec![step(
+                    Opcode::Mov,
+                    vec![at(RegisterType::Output, 1, one()), temp(first())],
+                )],
+            ]
+            .concat(),
+        };
+        let read = super::super::decompile(&program, &super::super::Names::default());
+        let body: Vec<&String> = read
+            .lines
+            .iter()
+            .filter(|line| line.contains("r0"))
+            .collect();
+        assert!(
+            body.iter().filter(|line| line.contains("r0.x =")).count() == 2,
+            "both branches have to write the register: {body:?}"
+        );
+    }
 
     fn def(register: u32, lanes: &[u8], block: usize) -> Def {
         Def {

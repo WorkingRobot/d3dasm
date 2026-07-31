@@ -229,7 +229,15 @@ impl Expr {
                 false => format!("{base}.{}", letters(swizzle)),
             },
             Self::Literal { bits, domain } => literal(bits, *domain),
-            Self::Unary { op, value } => bracket(format!("{op}{}", value.render(12)), 12, least),
+            Self::Unary { op, value } => {
+                let inner = value.render(12);
+                // A minus on a value that already renders negative would read as a decrement.
+                let inner = match *op == "-" && inner.starts_with('-') {
+                    true => format!("({inner})"),
+                    false => inner,
+                };
+                bracket(format!("{op}{inner}"), 12, least)
+            }
             Self::Binary { op, left, right } => {
                 let here = strength(op);
                 bracket(
@@ -345,6 +353,11 @@ fn literal(bits: &[u32], domain: Domain) -> String {
                 if !float.is_finite() {
                     return format!("asfloat({value:#010x}u)");
                 }
+                // A subnormal is not something a shader computed; it is a small integer kept in a
+                // float register, and `1.7e-44` hides that it is twelve.
+                if float.is_subnormal() {
+                    return format!("asfloat({value}u)");
+                }
                 match float == float.trunc() && float.abs() < 1e7 {
                     true => format!("{float:.1}"),
                     false => fraction(float).unwrap_or_else(|| format!("{float:?}")),
@@ -455,6 +468,23 @@ mod test {
             right: Box::new(read("r1", &[3, 3, 3])),
         };
         assert_eq!(sum.select(&[0, 2]).text(), "r0.xz + r1.ww");
+    }
+
+    #[test]
+    fn a_minus_on_a_negative_value_is_not_a_decrement() {
+        let negate = |value| Expr::Unary {
+            op: "-",
+            value: Box::new(value),
+        };
+        assert_eq!(negate(negate(read("r0", &[0]))).text(), "-(-r0.x)");
+        assert_eq!(
+            negate(Expr::Literal {
+                bits: vec![(-1.0f32).to_bits()],
+                domain: Domain::Float,
+            })
+            .text(),
+            "-(-1.0)"
+        );
     }
 
     #[test]

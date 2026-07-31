@@ -108,8 +108,31 @@ fn square(expr: &Expr) -> Option<&Expr> {
 /// Rewrite an expression into the idioms it was expanded from, innermost first. Under `exact`,
 /// nothing is recognised and only the broadcast collapse applies.
 pub fn simplify(expr: Expr, exact: bool) -> Expr {
-    let expr = descend(expr, exact);
+    let expr = neutralised(descend(expr, exact));
     collapsed(rewrite(expr, exact))
+}
+
+/// Masking with all ones, or setting none, which the machine does to carry a condition around and
+/// which says nothing about the value. True whatever reading is asked for, so it applies before the
+/// idioms an exact one leaves off.
+fn neutralised(expr: Expr) -> Expr {
+    let Expr::Binary { op, left, right } = &expr else {
+        return expr;
+    };
+    let neutral = |held: &Expr| {
+        matches!(held, Expr::Literal { bits, domain }
+        if matches!(domain, Domain::Uint | Domain::Bool)
+            && bits.iter().all(|held| match *op {
+                "&" => *held == u32::MAX,
+                "|" | "^" => *held == 0,
+                _ => false,
+            }))
+    };
+    match (neutral(left), neutral(right)) {
+        (true, false) => (**right).clone(),
+        (false, true) => (**left).clone(),
+        _ => expr,
+    }
 }
 
 /// One component spelled once rather than repeated to the width of what it is combined with. HLSL
@@ -478,6 +501,24 @@ fn rewrite(expr: Expr, exact: bool) -> Expr {
 #[cfg(test)]
 mod test {
     use super::*;
+
+    #[test]
+    fn masking_with_all_ones_says_nothing() {
+        let held = Expr::Read {
+            base: "r1".to_owned(),
+            swizzle: vec![0],
+        };
+        let ones = Expr::Literal {
+            bits: vec![u32::MAX],
+            domain: Domain::Uint,
+        };
+        let masked = Expr::Binary {
+            op: "&",
+            left: Box::new(held.clone()),
+            right: Box::new(ones),
+        };
+        assert_eq!(simplify(masked, true).text(), held.text());
+    }
 
     fn read(base: &str, swizzle: &[u8]) -> Expr {
         Expr::Read {

@@ -36,7 +36,7 @@
 //! caller makes.
 
 use dxbc::shex::{Instruction, InstructionKind, Opcode, Program, ReturnType};
-use std::collections::{BTreeSet, HashMap, HashSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 
 /// Constant buffer field layout, read from the RDEF chunk.
 pub mod layout;
@@ -763,7 +763,7 @@ fn buffer(
         // register of an element holds, which is the only way back from an index like `i * 6 + 5`.
         if let Some(held) = held.filter(|held| !held.members.is_empty()) {
             let stride = held.span();
-            if stride > 0 && registers > stride && registers % stride == 0 {
+            if stride > 0 && registers > stride && registers.is_multiple_of(stride) {
                 out.push(format!(
                     "// {} of {stride} registers each, indexed as `element * {stride} + register`:",
                     match registers / stride {
@@ -776,7 +776,11 @@ fn buffer(
         }
         out.push(format!("cbuffer cb{at} : register(b{at})"));
         out.push("{".to_owned());
-        out.push(format!("    float4 {name}[{registers}];"));
+        // One register is not an array of anything.
+        out.push(match registers {
+            1 => format!("    float4 {name};"),
+            held => format!("    float4 {name}[{held}];"),
+        });
         out.push("};".to_owned());
         return;
     };
@@ -937,6 +941,14 @@ pub fn read(program: &Program, names: &Names, reading: Reading) -> Decompiled {
         out.push("    Output output = (Output)0;".to_owned());
     }
 
+    // The register a value lands in is whichever one the compiler had free, so the numbers run
+    // sparse and high — a merged pass reaches r1713 for five hundred registers. Nothing depends on
+    // them but the reading, so they are renumbered in the order they first appear.
+    renumber(&mut builder.out, &mut builder.renamed);
+    // A register that only ever carries bits between an `asfloat` and an `asuint` is a float in
+    // name alone.
+    let carried = uncast(&mut builder.out);
+
     let temps = program
         .instructions
         .iter()
@@ -946,9 +958,49 @@ pub fn read(program: &Program, names: &Names, reading: Reading) -> Decompiled {
         })
         .unwrap_or(0);
     if temps > 0 {
-        let mut registers: Vec<String> = (0..temps).map(|index| format!("r{index}")).collect();
-        registers.append(&mut builder.renamed);
-        out.push(format!("    float4 {};", registers.join(", ")));
+        // The shader declares as many temps as the compiler allocated, but most of them end up
+        // folded into what reads them and never appear. Declaring those too costs nothing to the
+        // compiler and everything to whoever is reading: a merged pass allocates a temp per value
+        // and would open with a line naming eighteen hundred registers, five hundred of which the
+        // body mentions.
+        let registers: Vec<String> = (0..temps)
+            .map(|index| format!("r{index}"))
+            .filter(|name| builder.out.iter().any(|line| mentions(line, name)))
+            .collect();
+        let widths = widths(&builder.out);
+        // A register that is only ever one component does not need naming one.
+        narrow(&mut builder.out, &widths);
+        // A register the body only ever reads one component of does not need four, and saying so is
+        // the difference between a wall of `float4` and a declaration that describes the shader.
+        let mut banded: BTreeMap<String, Vec<String>> = BTreeMap::new();
+        for name in registers {
+            // Carrying bits changes what a register is declared as, never how wide it is.
+            let base = carried.get(&name).copied().unwrap_or("float");
+            let kind = match widths.get(&name).copied().unwrap_or(4) {
+                1 => base.to_owned(),
+                held => format!("{base}{held}"),
+            };
+            banded.entry(kind).or_default().push(name);
+        }
+        banded
+            .entry("float4".to_owned())
+            .or_default()
+            .append(&mut builder.renamed);
+        for (kind, held) in &banded {
+            // Five hundred of them on one line is not a declaration anybody reads; wrapped, it is a
+            // block that can be skipped over.
+            for (row, names) in held.chunks(WRAP).enumerate() {
+                let opening = match row {
+                    0 => format!("    {kind} "),
+                    _ => "        ".to_owned(),
+                };
+                let closing = match (row + 1) * WRAP < held.len() {
+                    true => ",",
+                    false => ";",
+                };
+                out.push(format!("{opening}{}{closing}", names.join(", ")));
+            }
+        }
     }
     for instruction in &program.instructions {
         let InstructionKind::DclIndexableTemp {
@@ -967,9 +1019,250 @@ pub fn read(program: &Program, names: &Names, reading: Reading) -> Decompiled {
     Decompiled { lines: out, body }
 }
 
+/// Registers that only carry bits, rewritten to the type those bits are, and named with it.
+///
+/// The machine has one register file and it is untyped, so an integer travelling in one is written
+/// through `asfloat` and read back through `asuint`. Where *every* write is that cast and *every*
+/// read undoes it with the same one, the casts say nothing the declaration cannot, and both come off.
+///
+/// Bit-preserving in both directions, which is what makes it safe: the declared type changes to the
+/// one the bits already were.
+fn uncast(body: &mut [String]) -> HashMap<String, &'static str> {
+    let mut kinds: HashMap<String, &'static str> = HashMap::new();
+    let mut names: Vec<String> = Vec::new();
+    for line in body.iter() {
+        if let Some((held, _)) = line.trim_start().split_once(" = ")
+            && held.starts_with('r')
+            && held[1..].chars().all(|held| held.is_ascii_digit())
+        {
+            names.push(held.to_owned());
+        }
+    }
+    names.sort_unstable();
+    names.dedup();
+
+    for name in names {
+        let write = format!("{name} = asfloat(");
+        let (mut writes, mut kind) = (0usize, None);
+        let mut usable = true;
+        for line in body.iter() {
+            let held = line.trim_start();
+            if held.starts_with(&write) && held.ends_with(");") {
+                writes += 1;
+                continue;
+            }
+            // Every other mention has to be one of the two casts undoing it.
+            let mut from = 0;
+            while let Some(at) = line[from..].find(&name) {
+                let at = from + at;
+                let before = line[..at].chars().next_back();
+                let after = line[at + name.len()..].chars().next();
+                from = at + name.len();
+                if before.is_some_and(|held| held.is_ascii_alphanumeric() || held == '_')
+                    || after.is_some_and(|held| held.is_ascii_alphanumeric() || held == '_')
+                {
+                    continue;
+                }
+                let wrapped = ["asuint(", "asint("]
+                    .into_iter()
+                    .find(|cast| line[..at].ends_with(cast) && after == Some(')'));
+                match wrapped {
+                    Some(cast) if kind.is_none_or(|held| held == cast) => kind = Some(cast),
+                    _ => {
+                        usable = false;
+                        break;
+                    }
+                }
+            }
+            if !usable {
+                break;
+            }
+        }
+        let Some(cast) = kind.filter(|_| usable && writes > 0) else {
+            continue;
+        };
+        kinds.insert(
+            name.clone(),
+            match cast {
+                "asuint(" => "uint",
+                _ => "int",
+            },
+        );
+        for line in body.iter_mut() {
+            let held = line.trim_start();
+            if held.starts_with(&write) && held.ends_with(");") {
+                let inner = &held[write.len()..held.len() - 2];
+                *line = format!("    {name} = {inner};");
+                continue;
+            }
+            *line = line.replace(&format!("{cast}{name})"), &name);
+        }
+    }
+    kinds
+}
+
+/// Registers to a line where they are declared together.
+const WRAP: usize = 12;
+
+/// `.x` taken off the registers that hold nothing else, since a `float` has no other component.
+///
+/// Only a bare `.x` goes: `r1.xx` is a broadcast into two components and still means something on a
+/// scalar.
+fn narrow(body: &mut [String], widths: &HashMap<String, usize>) {
+    for line in body.iter_mut() {
+        for (name, _) in widths.iter().filter(|(_, wide)| **wide == 1) {
+            let mut from = 0;
+            let wanted = format!("{name}.x");
+            while let Some(at) = line[from..].find(&wanted) {
+                let at = from + at;
+                let before = line[..at].chars().next_back();
+                let after = line[at + wanted.len()..].chars().next();
+                let bare = !before.is_some_and(|held| held.is_ascii_alphanumeric() || held == '_')
+                    && !after.is_some_and(|held| matches!(held, 'x' | 'y' | 'z' | 'w'));
+                match bare {
+                    true => {
+                        line.replace_range(at..at + wanted.len(), name);
+                        from = at + name.len();
+                    }
+                    false => from = at + wanted.len(),
+                }
+            }
+        }
+    }
+}
+
+/// How wide each register has to be declared: one past the highest component the body names.
+///
+/// Components are not remapped, so a register read at `.z` stays three wide even where nothing
+/// touches `.y`; the alternative is rewriting every swizzle that mentions it. A register used with
+/// no swizzle at all is whatever it was, which is four.
+fn widths(body: &[String]) -> HashMap<String, usize> {
+    let mut widths: HashMap<String, usize> = HashMap::new();
+    for line in body {
+        let held: Vec<char> = line.chars().collect();
+        let mut at = 0;
+        while at < held.len() {
+            let starts = held[at] == 'r'
+                && at + 1 < held.len()
+                && held[at + 1].is_ascii_digit()
+                && (at == 0 || !(held[at - 1].is_ascii_alphanumeric() || held[at - 1] == '_'));
+            if !starts {
+                at += 1;
+                continue;
+            }
+            let mut end = at + 1;
+            while end < held.len() && held[end].is_ascii_digit() {
+                end += 1;
+            }
+            if held
+                .get(end)
+                .is_some_and(|held| held.is_alphabetic() || *held == '_')
+            {
+                at = end;
+                continue;
+            }
+            let name: String = held[at..end].iter().collect();
+            let mut wide = 4;
+            if held.get(end) == Some(&'.') {
+                let lanes: String = held[end + 1..]
+                    .iter()
+                    .take_while(|held| matches!(held, 'x' | 'y' | 'z' | 'w'))
+                    .collect();
+                if !lanes.is_empty() {
+                    wide = lanes
+                        .chars()
+                        .map(|held| "xyzw".find(held).unwrap_or(3) + 1)
+                        .max()
+                        .unwrap_or(4);
+                }
+            }
+            let into = widths.entry(name).or_insert(1);
+            *into = (*into).max(wide);
+            at = end;
+        }
+    }
+    widths
+}
+
+/// Registers renumbered densely, in the order the body first mentions them.
+///
+/// A name is `r` and digits, and the typed copies of one lane carry it as a prefix (`r184_x`), so
+/// both move together.
+fn renumber(body: &mut [String], renamed: &mut [String]) {
+    let mut dense: HashMap<String, String> = HashMap::new();
+    let mut rewrite = |line: &mut String| {
+        let mut out = String::with_capacity(line.len());
+        let held: Vec<char> = line.chars().collect();
+        let mut at = 0;
+        while at < held.len() {
+            let starts = held[at] == 'r'
+                && at + 1 < held.len()
+                && held[at + 1].is_ascii_digit()
+                && (at == 0 || !(held[at - 1].is_ascii_alphanumeric() || held[at - 1] == '_'));
+            if !starts {
+                out.push(held[at]);
+                at += 1;
+                continue;
+            }
+            let mut end = at + 1;
+            while end < held.len() && held[end].is_ascii_digit() {
+                end += 1;
+            }
+            // `r1a` is somebody else's name; only digits then a break is a register.
+            match held.get(end).is_some_and(|held| held.is_ascii_alphabetic()) {
+                true => {
+                    out.extend(&held[at..end]);
+                }
+                false => {
+                    let name: String = held[at..end].iter().collect();
+                    let next = dense.len();
+                    out.push_str(
+                        dense
+                            .entry(name)
+                            .or_insert_with(|| format!("r{next}"))
+                            .as_str(),
+                    );
+                }
+            }
+            at = end;
+        }
+        *line = out;
+    };
+    for line in body.iter_mut() {
+        rewrite(line);
+    }
+    for name in renamed.iter_mut() {
+        rewrite(name);
+    }
+}
+
+/// Whether a line names this register, as opposed to one whose name it merely begins.
+fn mentions(line: &str, name: &str) -> bool {
+    let ident = |held: char| held.is_ascii_alphanumeric() || held == '_';
+    let mut from = 0;
+    while let Some(at) = line[from..].find(name) {
+        let at = from + at;
+        let before = line[..at].chars().next_back();
+        let after = line[at + name.len()..].chars().next();
+        if !before.is_some_and(ident) && !after.is_some_and(ident) {
+            return true;
+        }
+        from = at + name.len();
+    }
+    false
+}
+
 #[cfg(test)]
 mod test {
     use super::*;
+
+    #[test]
+    fn a_register_is_not_named_by_one_it_prefixes() {
+        assert!(mentions("    r1.x = r20.y;", "r1"));
+        assert!(!mentions("    r20.x = r201.y;", "r2"));
+        assert!(!mentions("    uint r18_x = 0;", "r18"));
+        assert!(mentions("    r7 = float4(0.0, 0.0, 0.0, 0.0);", "r7"));
+    }
 
     fn field(name: &str, register: u32, registers: u32, mask: u8) -> Field {
         Field {
